@@ -1,0 +1,19 @@
+{
+  "permissions": {
+    "defaultMode": "bypassPermissions",
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git commit --amend*)",
+      "Bash(git reset --hard*)",
+      "Bash(git rebase*)",
+      "Bash(git branch -D*)",
+      "Bash(git clean*)",
+      "Bash(rm -rf *)",
+      "Bash(Remove-Item -Recurse*)"
+    ]
+  },
+  "attribution": {
+    "commit": "",
+    "pr": ""
+  }
+}

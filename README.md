@@ -1,0 +1,158 @@
+# Velocity Growth: client campaign portal
+
+A multi-tenant campaign portal for three brands on one Supabase database. Each brand's marketing team signs in, sees its own contacts, campaigns and dashboard, sends campaigns through the VG messaging provider, and publishes password-protected result pages for clients without a login.
+
+Brands: Kilele Rides (Kenya, ~81k contacts), Karoo Coaches (South Africa, ~12.5k), Marrakech Express (Morocco, ~930).
+
+> Status: architecture draft, stage 0. Sections marked **decision** are settled. Sections marked **open** are awaiting a call.
+
+---
+
+## 1. Requirements, as I read them
+
+Eleven business rules from the brief, translated into what has to be true in the code.
+
+| # | Rule in the brief | What it means here |
+|---|---|---|
+| 1 | Six logins, owners send, analysts look, strangers get nothing | Pre-provisioned users only. Google sign-in must resolve to one of the six or be refused at the database, not the UI. |
+| 2 | A brand sees only its own data, on every route, including future ones | Row Level Security on every tenant table. The app never filters by brand in JavaScript as the guarantee. |
+| 3 | Data loads, marketer sees what did not, re-import is idempotent | Import writes rejects with reasons to a table the UI shows. Upsert on `(brand_id, external_id)`. |
+| 4 | Numbers are right, and say how they were counted | Every aggregate is computed in SQL and carries a definition string rendered next to it. |
+| 5 | Usable at 81k as at 930 | Server-side pagination, indexes on every filter column, aggregates never computed in the browser. |
+| 6 | Sending is safe and honest | Audience frozen at approval. Idempotency key stored before the provider call. Concurrent confirms collapse to one dispatch via a database state transition. |
+| 7 | Provider talks back while the app is not looking | A scheduled job inside Supabase polls the provider. Events deduplicated on provider event id, ordering never assumed. |
+| 8 | A test fails if isolation is removed | An automated suite signs in as each user and asserts cross-brand reads return nothing, plus a catalog test asserting RLS is enabled on every `brand_id` table. |
+| 9 | Shared link is stranger-safe | 256-bit token, hashed at rest. Password hashed with bcrypt. Attempt lockout. Renders one campaign's aggregates, no contact rows. |
+| 10 | Bad input rejected, states are explicit | Zod allow-list validation at every boundary. Loading, empty and error states on every view. |
+| 11 | A real app, phone and laptop | Responsive layout, deployed on Vercel. |
+
+## 2. What the seed data actually contains
+
+Measured on 13 Sep 2026 from the zip (SHA-256 verified). These shape the import rules.
+
+| Trap | Where | Rule adopted |
+|---|---|---|
+| Three column dialects | Karoo uses `Full Name`, `Email`, `External Id`; Marrakech uses `e_mail`, `mobile`, `pays` with `;` delimiter and `,` decimals; Kilele uses snake_case with a BOM | One canonical schema. Per-brand header alias map in the import config. |
+| Windows-1252 encoding | Karoo contacts | Decode as UTF-8, fall back to cp1252 on failure, record encoding in the import row. |
+| Repeated header row mid-file | Kilele contacts, row ~42k | Reject rows whose id equals the header name. |
+| Column-shifted rows | 46 in Karoo, 15 in Marrakech (`country = ZZ`) | Reject: id fails the `CT-\d+` allow-list pattern. |
+| Rows tagged with another brand | 312 `KAROO` rows inside the Kilele file (emails `leak.kar.*`), 88 `KILELE` rows inside Karoo | The file's brand wins. Rows whose `brand_code` disagrees are rejected with reason `brand_code mismatch`. They never enter the other brand. |
+| Duplicate ids, some conflicting | Kilele 2,778 ids appear twice, 368 with different values | Last row in the file wins. Delta file applied after base. Recorded in `contacts.source_file`. |
+| Cross-brand id collisions | Kilele and Karoo share 12,407 external ids | Uniqueness is `(brand_id, external_id)`. Provider recipient id is our UUID, never the external id. |
+| Eleven spellings of a boolean | `true/1/TRUE/yes/Y` and `0/no/FALSE/false/f` plus empty | Allow-list normaliser. Empty consent is `false` (no consent recorded). Anything else rejected. |
+| Status variants | `active`, `ACTIVE`, `active `, `Active`, `unsubscribe` | Trim, lowercase, map `unsubscribe` to `unsubscribed`. Allow-list: active, unsubscribed, bounced, pending. |
+| Country variants | `KE`, `KEN`, `kenya`, `Kenya`, `ke `, `254`, `NULL`, `null`, `none` | Normalise to ISO-2 via allow-list map. `254`, `NULL`, `none` become null country, row kept, `notes` flagged. |
+| Three date formats | ISO, `YYYY-MM-DD`, `DD/MM/YYYY HH:MM` | Parse all three. Day-first for the slash form (Kenya locale). Unparseable dates reject the row. |
+| Phones in scientific notation | 44 Kilele rows like `2.54E+11` | Reject with reason `phone corrupted by spreadsheet export`. |
+| Invalid emails | 389 in Kilele (`john doe@`, `no-tld@vg-eval`, `double@@`) | Row kept, email set null, flagged `email invalid`. Contact is not contactable by email. |
+| Duplicate campaigns | `CMP-014` and `KIL-0044` twice in Kilele | Last row wins on `(brand_id, external_id)`. |
+| Cross-brand campaign parent | Karoo `CMP-014` has parent `KIL-0007`, a Kilele campaign | Parent resolved within brand only. Unresolvable parent stored as text, not a foreign key, and flagged. |
+| Orphan events | Marrakech has 633 events for 12 campaigns (MAR-0007 to MAR-0018) absent from its campaign file | **Decision:** rejected with reason `unknown campaign <id>`, shown in the imports view. No placeholder campaigns are invented. |
+| Duplicate event ids | 8,310 in Kilele, 4,735 in Karoo | Uniqueness `(brand_id, event_id)`. Second occurrence skipped and counted. |
+| Reported opens exceed delivered | `KIL-0016`: 12,679 opens, 10,108 delivered | Reported figures are total events. Dashboard labels "reported by brand (total)" vs "observed in event log (unique contacts)". |
+| Event log is a tenth of reported volume | Every brand | Two sources, both shown, both labelled. Neither is silently preferred. |
+| Last 30 days of signups is nearly empty | Only the Kilele delta has August signups; Karoo and Marrakech have none after April | Chart renders an explicit "no signups in this window" state with the date range shown. |
+| Send log retry | `BATCH-0003` appears three times | Imported as three attempts of one batch. It is the seed's own idempotency example. |
+
+## 3. Provider findings
+
+Base URL `https://dispatcher-production-72fc.up.railway.app`. Verified on 13 Sep 2026: `/healthz` returns 200, `/v1/messages/{id}/events` returns 401 without a key and 404 with a key for an unknown batch. No message has been sent yet.
+
+The docs claim the event stream is "clean and complete: every event is delivered exactly once and in order". The brief says reports will be "deliberately messy and out of order". **Decision:** trust the brief. Dedupe on event id, tolerate any order, treat `since` as a hint not a guarantee.
+
+The docs list event types `delivered, bounced, opened, unsubscribed`. The seed event log uses `bounce, click, open, complaint, unsubscribe`. **Decision:** one internal enum with a mapping table for both vocabularies; unknown types are stored raw and flagged, never dropped.
+
+The docs call `Idempotency-Key` optional. **Decision:** mandatory for every dispatch; the key is the send id, stored before the call.
+
+## 4. Architecture
+
+**Decision:** Next.js App Router (TypeScript) on Vercel for the UI and server actions. Supabase for Postgres, Auth, RLS, Edge Functions and pg_cron. Tailwind and shadcn/ui. Vitest and Playwright.
+
+```
+Browser ──► Next.js (Vercel)
+              │  server actions / route handlers, user JWT
+              ▼
+            Supabase Postgres  ◄── RLS on every tenant table (the guarantee)
+              │ ▲
+              │ └── pg_cron every minute ──► Edge Function poll-provider ──► GET /v1/messages/{batch}/events
+              │
+              └── Edge Function dispatch-send ──► POST /v1/messages (Idempotency-Key = send id)
+
+/share/[token] ──► Next.js route handler, service role, reads one share_link → one campaign's aggregates
+```
+
+### 4.1 Tables
+
+Every tenant table has `brand_id uuid not null references brands`, RLS enabled and forced, and a policy `brand_id in (select brand_id from memberships where user_id = auth.uid())` for select, with `with check` on writes.
+
+| Table | Purpose | Unique key |
+|---|---|---|
+| `brands` | The three tenants | `code` |
+| `memberships` | user → brand → role (`owner`, `analyst`) | `(user_id, brand_id)` |
+| `allowed_emails` | The six pre-provisioned logins. A trigger on `auth.users` refuses any sign-up whose email is not here, which is what makes Google sign-in safe. | `email` |
+| `contacts` | Canonical contact | `(brand_id, external_id)` |
+| `campaigns` | Canonical campaign with reported figures | `(brand_id, external_id)` |
+| `engagement_events` | Seed event log | `(brand_id, event_id)` |
+| `imports` | One row per file load: counts, status, encoding, started and finished | |
+| `import_rejects` | Every rejected row: raw JSON, row number, reason | |
+| `sends` | Lifecycle of one send: `approved → dispatching → dispatched → failed`, approved count, idempotency key, provider batch id, poll cursor | `idempotency_key` |
+| `send_recipients` | The frozen audience and per-recipient provider status | `(send_id, contact_id)` |
+| `provider_events` | Raw events from the provider | `(send_id, provider_event_id)` |
+| `share_links` | Token hash, bcrypt password hash, campaign, expiry, revoked, attempt counter | `token_hash` |
+
+### 4.2 Isolation
+
+Where the guarantee lives, for the submission note: the `using` clause of each RLS policy in the first migration, plus `alter table ... force row level security` so even table owners cannot bypass it. No service-role key in any user-facing code path. Service role is used in exactly three places, each commented: the import CLI, the two Edge Functions, and the `/share` route handler. Each of those filters by a brand it has already resolved from a trusted source, never from a request parameter alone.
+
+### 4.3 Send path
+
+1. Owner opens a campaign and clicks Send. Server action calls `approve_send(campaign_id)` in SQL. The function checks role = owner inside the function, snapshots the contactable audience into `send_recipients`, writes `approved_count`, sets `idempotency_key = send.id`. Returns the send. Screen shows the count and the definition of contactable.
+2. Owner confirms. Server action calls Edge Function `dispatch-send` with the user's JWT. The function runs `update sends set status = 'dispatching' where id = $1 and status = 'approved' returning *`. Zero rows means another session got there first; the function returns the current state and makes no provider call. One row means this caller owns the dispatch.
+3. Provider is called with `Idempotency-Key: <send id>`. Response `batch_id` stored, status `dispatched`, `accepted` and `rejected` arrays written to `send_recipients`.
+4. If the function dies between step 2 and 3, the send is stuck in `dispatching` with no batch id. A retry from the UI re-runs the provider call with the same key, which the provider contract makes safe. This behaviour is verified against the live API before the feature is marked done, and the result is written here.
+5. `poll-provider` runs every minute via pg_cron. For each send in `dispatched` with `has_more` or recent activity, it pages `/events` from the stored cursor, inserts into `provider_events` ignoring duplicates, and updates `send_recipients` and `contacts` (an `unsubscribed` or `bounced` makes the contact not contactable; no later event reverts that).
+
+### 4.4 Shared link
+
+`publish_results(campaign_id, password)` (owner only, in SQL) creates a `share_links` row with a 32-byte random token, stores `sha256(token)` and `bcrypt(password)`, and returns the plain token once. The URL is `/share/<token>`. The route handler hashes the token, finds the link, checks not revoked or expired, compares the password with bcrypt, increments attempts, locks after 10 failures, and on success sets a signed HttpOnly cookie scoped to that path for one hour. The page renders the campaign's aggregates only. Nothing on that page accepts an id from the request.
+
+### 4.5 Definitions shown on screen
+
+| Number | Definition |
+|---|---|
+| Total customers | Contacts with `deleted_at` null. Deleted contacts excluded and the count of them shown alongside. |
+| Contactable | Status `active`, consent true, not deleted, `suppressed_until` null or past, a valid email or phone, and no unsubscribe, bounce or complaint in the event log or provider feedback. |
+| Signups per day, last 30 days | By `signup_at` date in UTC, for the 30 days ending today. |
+| Campaign delivered / bounced / opens / clicks | Two columns: "reported by brand" from the campaign file (totals), and "observed" from the event log (unique contacts). |
+| Send delivery | From `provider_events`, unique recipients per event type. |
+
+## 5. Testing
+
+- Unit (Vitest): every normaliser and parser, driven by the real quirks in section 2.
+- RLS (Vitest against the linked Supabase project): signs in as all six users with the anon key, runs select, insert and update against every tenant table and every RPC with another brand's ids, asserts zero rows or a permission error. A catalog test reads `pg_tables` and `pg_policies` and fails if any table with a `brand_id` column lacks RLS or a policy. Dropping a policy fails the suite.
+- Send concurrency (Vitest, provider base URL pointed at a local mock): two concurrent dispatches produce one provider request.
+- End to end (Playwright): owner sends, analyst cannot, stranger gets nothing from the share link without the password.
+
+## 6. Stages
+
+Each stage is one commit, made only when asked.
+
+| Stage | Scope |
+|---|---|
+| 0 | Claude harness: rules, agents, skills, settings |
+| 1 | Scaffold app, Supabase project, migration with all tables, RLS, six users, RLS test suite |
+| 2 | Import pipeline: parsers, normalisers, rejects, run against the seed |
+| 3 | Auth (email and Google), layout, contacts and campaigns views, imports view |
+| 4 | Dashboard with definitions |
+| 5 | Send flow, Edge Functions, polling, live provider verification |
+| 6 | Shared results link |
+| 7 | Mobile pass, states, `schema.sql`, deploy, submission note |
+
+## 7. Open decisions
+
+- **Import trigger:** CLI run by the engineer (proposed, the brief gives us the files), or a file upload in the UI.
+- **Hosting of the provider calls:** Supabase Edge Functions (proposed, keeps the key in Supabase and the graders can see function names), or Next.js route handlers on Vercel called by pg_cron.
+
+## 8. AI tools
+
+Claude Code (Fable 5.1) with project-scoped agents for review, security review, testing and linting. Every generated change is run through those agents before the user decides whether to commit. All commits are authored by the engineer alone.
