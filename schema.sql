@@ -1,0 +1,1099 @@
+
+
+
+SET statement_timeout = 0;
+SET lock_timeout = 0;
+SET idle_in_transaction_session_timeout = 0;
+SET client_encoding = 'UTF8';
+SET standard_conforming_strings = on;
+SELECT pg_catalog.set_config('search_path', '', false);
+SET check_function_bodies = false;
+SET xmloption = content;
+SET client_min_messages = warning;
+SET row_security = off;
+
+
+CREATE SCHEMA IF NOT EXISTS "app";
+
+
+ALTER SCHEMA "app" OWNER TO "postgres";
+
+
+COMMENT ON SCHEMA "app" IS 'Helper functions used by RLS policies and triggers. Not a data schema.';
+
+
+
+CREATE SCHEMA IF NOT EXISTS "public";
+
+
+ALTER SCHEMA "public" OWNER TO "pg_database_owner";
+
+
+COMMENT ON SCHEMA "public" IS 'standard public schema';
+
+
+
+CREATE TYPE "public"."channel" AS ENUM (
+    'email',
+    'sms'
+);
+
+
+ALTER TYPE "public"."channel" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."contact_status" AS ENUM (
+    'active',
+    'unsubscribed',
+    'bounced',
+    'pending'
+);
+
+
+ALTER TYPE "public"."contact_status" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."engagement_event_type" AS ENUM (
+    'open',
+    'click',
+    'bounce',
+    'complaint',
+    'unsubscribe',
+    'delivered',
+    'unknown'
+);
+
+
+ALTER TYPE "public"."engagement_event_type" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."import_kind" AS ENUM (
+    'contacts',
+    'campaigns',
+    'events',
+    'send_log'
+);
+
+
+ALTER TYPE "public"."import_kind" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."import_status" AS ENUM (
+    'running',
+    'succeeded',
+    'failed'
+);
+
+
+ALTER TYPE "public"."import_status" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."membership_role" AS ENUM (
+    'owner',
+    'analyst'
+);
+
+
+ALTER TYPE "public"."membership_role" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."recipient_status" AS ENUM (
+    'queued',
+    'accepted',
+    'rejected',
+    'delivered',
+    'bounced',
+    'opened',
+    'clicked',
+    'unsubscribed',
+    'complained'
+);
+
+
+ALTER TYPE "public"."recipient_status" OWNER TO "postgres";
+
+
+CREATE TYPE "public"."send_status" AS ENUM (
+    'approved',
+    'dispatching',
+    'dispatched',
+    'failed'
+);
+
+
+ALTER TYPE "public"."send_status" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "app"."create_membership_for_new_user"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+begin
+  insert into public.memberships (user_id, brand_id, role)
+  select new.id, a.brand_id, a.role
+  from public.allowed_emails a
+  where a.email = lower(new.email)
+  on conflict (user_id, brand_id) do nothing;
+  return new;
+end $$;
+
+
+ALTER FUNCTION "app"."create_membership_for_new_user"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "app"."enforce_allowed_email"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+begin
+  if new.email is null or not exists (
+    select 1 from public.allowed_emails a where a.email = lower(new.email)
+  ) then
+    raise exception 'sign-up refused: % is not an allowed login', coalesce(new.email, '<null>')
+      using errcode = '42501';
+  end if;
+  return new;
+end $$;
+
+
+ALTER FUNCTION "app"."enforce_allowed_email"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  select exists (
+    select 1 from public.memberships m
+    where m.user_id = auth.uid() and m.brand_id = p_brand_id and m.role = 'owner'
+  )
+$$;
+
+
+ALTER FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "app"."set_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+begin
+  new.updated_at = now();
+  return new;
+end $$;
+
+
+ALTER FUNCTION "app"."set_updated_at"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "app"."user_brand_ids"() RETURNS SETOF "uuid"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  select m.brand_id from public.memberships m where m.user_id = auth.uid()
+$$;
+
+
+ALTER FUNCTION "app"."user_brand_ids"() OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."allowed_emails" (
+    "email" "text" NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "role" "public"."membership_role" NOT NULL,
+    "display_name" "text" NOT NULL,
+    CONSTRAINT "allowed_emails_email_check" CHECK (("email" = "lower"("email")))
+);
+
+ALTER TABLE ONLY "public"."allowed_emails" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."allowed_emails" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."allowed_emails" IS 'The only logins that may exist. Enforced by a trigger on auth.users. Never readable by clients.';
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."brands" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "code" "text" NOT NULL,
+    "name" "text" NOT NULL,
+    "country" "text" NOT NULL,
+    "timezone" "text" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "brands_code_check" CHECK (("code" ~ '^[A-Z]{3,16}$'::"text")),
+    CONSTRAINT "brands_country_check" CHECK (("country" ~ '^[A-Z]{2}$'::"text"))
+);
+
+ALTER TABLE ONLY "public"."brands" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."brands" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."campaigns" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "name" "text" NOT NULL,
+    "channel" "public"."channel" NOT NULL,
+    "target_country" "text",
+    "reported_sent" integer,
+    "reported_delivered" integer,
+    "reported_bounced" integer,
+    "reported_opens" integer,
+    "reported_clicks" integer,
+    "spend" numeric(12,2),
+    "sent_at" timestamp with time zone,
+    "send_local_time" "text",
+    "parent_external_id" "text",
+    "parent_campaign_id" "uuid",
+    "flags" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "source_import_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "campaigns_reported_bounced_check" CHECK ((("reported_bounced" IS NULL) OR ("reported_bounced" >= 0))),
+    CONSTRAINT "campaigns_reported_clicks_check" CHECK ((("reported_clicks" IS NULL) OR ("reported_clicks" >= 0))),
+    CONSTRAINT "campaigns_reported_delivered_check" CHECK ((("reported_delivered" IS NULL) OR ("reported_delivered" >= 0))),
+    CONSTRAINT "campaigns_reported_opens_check" CHECK ((("reported_opens" IS NULL) OR ("reported_opens" >= 0))),
+    CONSTRAINT "campaigns_reported_sent_check" CHECK ((("reported_sent" IS NULL) OR ("reported_sent" >= 0))),
+    CONSTRAINT "campaigns_spend_check" CHECK ((("spend" IS NULL) OR ("spend" >= (0)::numeric))),
+    CONSTRAINT "campaigns_target_country_check" CHECK ((("target_country" IS NULL) OR ("target_country" ~ '^[A-Z]{2}$'::"text")))
+);
+
+ALTER TABLE ONLY "public"."campaigns" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."campaigns" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."contacts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "full_name" "text",
+    "email" "text",
+    "phone" "text",
+    "country" "text",
+    "city" "text",
+    "signup_at" timestamp with time zone,
+    "status" "public"."contact_status" NOT NULL,
+    "consent_marketing" boolean NOT NULL,
+    "deleted_at" timestamp with time zone,
+    "suppressed_until" timestamp with time zone,
+    "notes" "text",
+    "flags" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "source_import_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "contacts_country_check" CHECK ((("country" IS NULL) OR ("country" ~ '^[A-Z]{2}$'::"text"))),
+    CONSTRAINT "contacts_email_check" CHECK ((("email" IS NULL) OR ("email" ~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'::"text"))),
+    CONSTRAINT "contacts_external_id_check" CHECK (("external_id" ~ '^CT-[0-9]+$'::"text"))
+);
+
+ALTER TABLE ONLY "public"."contacts" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."contacts" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."engagement_events" (
+    "id" bigint NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "event_id" "text" NOT NULL,
+    "contact_id" "uuid" NOT NULL,
+    "campaign_id" "uuid" NOT NULL,
+    "event_type" "public"."engagement_event_type" NOT NULL,
+    "raw_event_type" "text" NOT NULL,
+    "channel" "public"."channel" NOT NULL,
+    "occurred_at" timestamp with time zone NOT NULL,
+    "source_import_id" "uuid"
+);
+
+ALTER TABLE ONLY "public"."engagement_events" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."engagement_events" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."engagement_events" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."engagement_events_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."import_rejects" (
+    "id" bigint NOT NULL,
+    "import_id" "uuid" NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "row_number" integer NOT NULL,
+    "reason" "text" NOT NULL,
+    "raw" "jsonb" NOT NULL
+);
+
+ALTER TABLE ONLY "public"."import_rejects" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."import_rejects" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."import_rejects" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."import_rejects_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."imports" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "kind" "public"."import_kind" NOT NULL,
+    "file_name" "text" NOT NULL,
+    "file_sha256" "text" NOT NULL,
+    "encoding" "text" NOT NULL,
+    "status" "public"."import_status" DEFAULT 'running'::"public"."import_status" NOT NULL,
+    "rows_read" integer DEFAULT 0 NOT NULL,
+    "rows_upserted" integer DEFAULT 0 NOT NULL,
+    "rows_rejected" integer DEFAULT 0 NOT NULL,
+    "rows_skipped_duplicate" integer DEFAULT 0 NOT NULL,
+    "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "finished_at" timestamp with time zone,
+    "error" "text"
+);
+
+ALTER TABLE ONLY "public"."imports" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."imports" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."memberships" (
+    "user_id" "uuid" NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "role" "public"."membership_role" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+ALTER TABLE ONLY "public"."memberships" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."memberships" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."provider_events" (
+    "id" bigint NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "send_id" "uuid" NOT NULL,
+    "provider_event_id" "text" NOT NULL,
+    "event_type" "text" NOT NULL,
+    "recipient_id" "uuid",
+    "occurred_at" timestamp with time zone,
+    "received_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "raw" "jsonb" NOT NULL
+);
+
+ALTER TABLE ONLY "public"."provider_events" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."provider_events" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."provider_events" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."provider_events_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."send_log_entries" (
+    "id" bigint NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "batch_key" "text" NOT NULL,
+    "campaign_id" "uuid",
+    "campaign_external_id" "text" NOT NULL,
+    "queued_at" timestamp with time zone NOT NULL,
+    "recipient_count" integer NOT NULL,
+    "status" "text" NOT NULL,
+    "attempt_no" integer NOT NULL,
+    "source_import_id" "uuid",
+    CONSTRAINT "send_log_entries_attempt_no_check" CHECK (("attempt_no" >= 1)),
+    CONSTRAINT "send_log_entries_recipient_count_check" CHECK (("recipient_count" >= 0))
+);
+
+ALTER TABLE ONLY "public"."send_log_entries" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."send_log_entries" OWNER TO "postgres";
+
+
+ALTER TABLE "public"."send_log_entries" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
+    SEQUENCE NAME "public"."send_log_entries_id_seq"
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1
+);
+
+
+
+CREATE TABLE IF NOT EXISTS "public"."send_recipients" (
+    "send_id" "uuid" NOT NULL,
+    "contact_id" "uuid" NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "status" "public"."recipient_status" DEFAULT 'queued'::"public"."recipient_status" NOT NULL,
+    "last_event_at" timestamp with time zone
+);
+
+ALTER TABLE ONLY "public"."send_recipients" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."send_recipients" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."sends" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "campaign_id" "uuid" NOT NULL,
+    "status" "public"."send_status" DEFAULT 'approved'::"public"."send_status" NOT NULL,
+    "audience_definition" "text" NOT NULL,
+    "approved_count" integer NOT NULL,
+    "approved_by" "uuid" NOT NULL,
+    "approved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idempotency_key" "text" NOT NULL,
+    "dispatch_started_at" timestamp with time zone,
+    "dispatched_at" timestamp with time zone,
+    "provider_batch_id" "text",
+    "provider_accepted" integer,
+    "provider_rejected" integer,
+    "last_error" "text",
+    "poll_cursor" "text",
+    "last_polled_at" timestamp with time zone,
+    "poll_complete" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "sends_approved_count_check" CHECK (("approved_count" >= 0))
+);
+
+ALTER TABLE ONLY "public"."sends" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."sends" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."share_links" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "campaign_id" "uuid" NOT NULL,
+    "token_hash" "text" NOT NULL,
+    "password_hash" "text" NOT NULL,
+    "created_by" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "expires_at" timestamp with time zone NOT NULL,
+    "revoked_at" timestamp with time zone,
+    "failed_attempts" integer DEFAULT 0 NOT NULL,
+    "locked_until" timestamp with time zone
+);
+
+ALTER TABLE ONLY "public"."share_links" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."share_links" OWNER TO "postgres";
+
+
+ALTER TABLE ONLY "public"."allowed_emails"
+    ADD CONSTRAINT "allowed_emails_pkey" PRIMARY KEY ("email");
+
+
+
+ALTER TABLE ONLY "public"."brands"
+    ADD CONSTRAINT "brands_code_key" UNIQUE ("code");
+
+
+
+ALTER TABLE ONLY "public"."brands"
+    ADD CONSTRAINT "brands_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."campaigns"
+    ADD CONSTRAINT "campaigns_brand_id_external_id_key" UNIQUE ("brand_id", "external_id");
+
+
+
+ALTER TABLE ONLY "public"."campaigns"
+    ADD CONSTRAINT "campaigns_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."contacts"
+    ADD CONSTRAINT "contacts_brand_id_external_id_key" UNIQUE ("brand_id", "external_id");
+
+
+
+ALTER TABLE ONLY "public"."contacts"
+    ADD CONSTRAINT "contacts_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_brand_id_event_id_key" UNIQUE ("brand_id", "event_id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."import_rejects"
+    ADD CONSTRAINT "import_rejects_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."imports"
+    ADD CONSTRAINT "imports_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."memberships"
+    ADD CONSTRAINT "memberships_pkey" PRIMARY KEY ("user_id", "brand_id");
+
+
+
+ALTER TABLE ONLY "public"."provider_events"
+    ADD CONSTRAINT "provider_events_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."provider_events"
+    ADD CONSTRAINT "provider_events_send_id_provider_event_id_key" UNIQUE ("send_id", "provider_event_id");
+
+
+
+ALTER TABLE ONLY "public"."send_log_entries"
+    ADD CONSTRAINT "send_log_entries_brand_id_batch_key_attempt_no_key" UNIQUE ("brand_id", "batch_key", "attempt_no");
+
+
+
+ALTER TABLE ONLY "public"."send_log_entries"
+    ADD CONSTRAINT "send_log_entries_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."send_recipients"
+    ADD CONSTRAINT "send_recipients_pkey" PRIMARY KEY ("send_id", "contact_id");
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_idempotency_key_key" UNIQUE ("idempotency_key");
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_provider_batch_id_key" UNIQUE ("provider_batch_id");
+
+
+
+ALTER TABLE ONLY "public"."share_links"
+    ADD CONSTRAINT "share_links_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."share_links"
+    ADD CONSTRAINT "share_links_token_hash_key" UNIQUE ("token_hash");
+
+
+
+CREATE INDEX "campaigns_brand_sent_idx" ON "public"."campaigns" USING "btree" ("brand_id", "sent_at" DESC);
+
+
+
+CREATE INDEX "contacts_brand_email_idx" ON "public"."contacts" USING "btree" ("brand_id", "lower"("email"));
+
+
+
+CREATE INDEX "contacts_brand_signup_idx" ON "public"."contacts" USING "btree" ("brand_id", "signup_at");
+
+
+
+CREATE INDEX "contacts_brand_status_idx" ON "public"."contacts" USING "btree" ("brand_id", "status");
+
+
+
+CREATE INDEX "engagement_events_campaign_idx" ON "public"."engagement_events" USING "btree" ("brand_id", "campaign_id", "event_type");
+
+
+
+CREATE INDEX "engagement_events_contact_idx" ON "public"."engagement_events" USING "btree" ("brand_id", "contact_id");
+
+
+
+CREATE INDEX "import_rejects_import_idx" ON "public"."import_rejects" USING "btree" ("brand_id", "import_id");
+
+
+
+CREATE INDEX "imports_brand_started_idx" ON "public"."imports" USING "btree" ("brand_id", "started_at" DESC);
+
+
+
+CREATE INDEX "send_recipients_status_idx" ON "public"."send_recipients" USING "btree" ("brand_id", "send_id", "status");
+
+
+
+CREATE INDEX "sends_brand_campaign_idx" ON "public"."sends" USING "btree" ("brand_id", "campaign_id", "approved_at" DESC);
+
+
+
+CREATE INDEX "sends_poll_idx" ON "public"."sends" USING "btree" ("status", "poll_complete") WHERE (("status" = 'dispatched'::"public"."send_status") AND ("poll_complete" = false));
+
+
+
+CREATE INDEX "share_links_brand_idx" ON "public"."share_links" USING "btree" ("brand_id", "campaign_id");
+
+
+
+CREATE OR REPLACE TRIGGER "campaigns_updated_at" BEFORE UPDATE ON "public"."campaigns" FOR EACH ROW EXECUTE FUNCTION "app"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "contacts_updated_at" BEFORE UPDATE ON "public"."contacts" FOR EACH ROW EXECUTE FUNCTION "app"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "sends_updated_at" BEFORE UPDATE ON "public"."sends" FOR EACH ROW EXECUTE FUNCTION "app"."set_updated_at"();
+
+
+
+ALTER TABLE ONLY "public"."allowed_emails"
+    ADD CONSTRAINT "allowed_emails_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."campaigns"
+    ADD CONSTRAINT "campaigns_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."campaigns"
+    ADD CONSTRAINT "campaigns_parent_campaign_id_fkey" FOREIGN KEY ("parent_campaign_id") REFERENCES "public"."campaigns"("id");
+
+
+
+ALTER TABLE ONLY "public"."campaigns"
+    ADD CONSTRAINT "campaigns_source_import_id_fkey" FOREIGN KEY ("source_import_id") REFERENCES "public"."imports"("id");
+
+
+
+ALTER TABLE ONLY "public"."contacts"
+    ADD CONSTRAINT "contacts_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."contacts"
+    ADD CONSTRAINT "contacts_source_import_id_fkey" FOREIGN KEY ("source_import_id") REFERENCES "public"."imports"("id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_campaign_id_fkey" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_contact_id_fkey" FOREIGN KEY ("contact_id") REFERENCES "public"."contacts"("id");
+
+
+
+ALTER TABLE ONLY "public"."engagement_events"
+    ADD CONSTRAINT "engagement_events_source_import_id_fkey" FOREIGN KEY ("source_import_id") REFERENCES "public"."imports"("id");
+
+
+
+ALTER TABLE ONLY "public"."import_rejects"
+    ADD CONSTRAINT "import_rejects_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."import_rejects"
+    ADD CONSTRAINT "import_rejects_import_id_fkey" FOREIGN KEY ("import_id") REFERENCES "public"."imports"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."imports"
+    ADD CONSTRAINT "imports_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."memberships"
+    ADD CONSTRAINT "memberships_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."memberships"
+    ADD CONSTRAINT "memberships_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."provider_events"
+    ADD CONSTRAINT "provider_events_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."provider_events"
+    ADD CONSTRAINT "provider_events_recipient_id_fkey" FOREIGN KEY ("recipient_id") REFERENCES "public"."contacts"("id");
+
+
+
+ALTER TABLE ONLY "public"."provider_events"
+    ADD CONSTRAINT "provider_events_send_id_fkey" FOREIGN KEY ("send_id") REFERENCES "public"."sends"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."send_log_entries"
+    ADD CONSTRAINT "send_log_entries_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_log_entries"
+    ADD CONSTRAINT "send_log_entries_campaign_id_fkey" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_log_entries"
+    ADD CONSTRAINT "send_log_entries_source_import_id_fkey" FOREIGN KEY ("source_import_id") REFERENCES "public"."imports"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_recipients"
+    ADD CONSTRAINT "send_recipients_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_recipients"
+    ADD CONSTRAINT "send_recipients_contact_id_fkey" FOREIGN KEY ("contact_id") REFERENCES "public"."contacts"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_recipients"
+    ADD CONSTRAINT "send_recipients_send_id_fkey" FOREIGN KEY ("send_id") REFERENCES "public"."sends"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_approved_by_fkey" FOREIGN KEY ("approved_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."sends"
+    ADD CONSTRAINT "sends_campaign_id_fkey" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id");
+
+
+
+ALTER TABLE ONLY "public"."share_links"
+    ADD CONSTRAINT "share_links_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."share_links"
+    ADD CONSTRAINT "share_links_campaign_id_fkey" FOREIGN KEY ("campaign_id") REFERENCES "public"."campaigns"("id");
+
+
+
+ALTER TABLE ONLY "public"."share_links"
+    ADD CONSTRAINT "share_links_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE "public"."allowed_emails" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."brands" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "brands_select_member" ON "public"."brands" FOR SELECT TO "authenticated" USING (("id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."campaigns" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "campaigns_select_own_brand" ON "public"."campaigns" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."contacts" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "contacts_select_own_brand" ON "public"."contacts" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."engagement_events" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "engagement_events_select_own_brand" ON "public"."engagement_events" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."import_rejects" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "import_rejects_select_own_brand" ON "public"."import_rejects" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."imports" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "imports_select_own_brand" ON "public"."imports" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."memberships" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "memberships_select_self" ON "public"."memberships" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."provider_events" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "provider_events_select_own_brand" ON "public"."provider_events" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."send_log_entries" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "send_log_entries_select_own_brand" ON "public"."send_log_entries" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."send_recipients" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "send_recipients_select_own_brand" ON "public"."send_recipients" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."sends" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "sends_select_own_brand" ON "public"."sends" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+ALTER TABLE "public"."share_links" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "share_links_select_own_brand" ON "public"."share_links" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
+GRANT USAGE ON SCHEMA "app" TO "authenticated";
+GRANT USAGE ON SCHEMA "app" TO "supabase_auth_admin";
+
+
+
+GRANT USAGE ON SCHEMA "public" TO "postgres";
+GRANT USAGE ON SCHEMA "public" TO "anon";
+GRANT USAGE ON SCHEMA "public" TO "authenticated";
+GRANT USAGE ON SCHEMA "public" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "app"."create_membership_for_new_user"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "app"."create_membership_for_new_user"() TO "supabase_auth_admin";
+
+
+
+REVOKE ALL ON FUNCTION "app"."enforce_allowed_email"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "app"."enforce_allowed_email"() TO "supabase_auth_admin";
+
+
+
+REVOKE ALL ON FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "app"."user_brand_ids"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "app"."user_brand_ids"() TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."allowed_emails" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."brands" TO "service_role";
+GRANT SELECT ON TABLE "public"."brands" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."campaigns" TO "service_role";
+GRANT SELECT ON TABLE "public"."campaigns" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."contacts" TO "service_role";
+GRANT SELECT ON TABLE "public"."contacts" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."engagement_events" TO "service_role";
+GRANT SELECT ON TABLE "public"."engagement_events" TO "authenticated";
+
+
+
+GRANT ALL ON SEQUENCE "public"."engagement_events_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."import_rejects" TO "service_role";
+GRANT SELECT ON TABLE "public"."import_rejects" TO "authenticated";
+
+
+
+GRANT ALL ON SEQUENCE "public"."import_rejects_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."imports" TO "service_role";
+GRANT SELECT ON TABLE "public"."imports" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."memberships" TO "service_role";
+GRANT SELECT ON TABLE "public"."memberships" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."provider_events" TO "service_role";
+GRANT SELECT ON TABLE "public"."provider_events" TO "authenticated";
+
+
+
+GRANT ALL ON SEQUENCE "public"."provider_events_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."send_log_entries" TO "service_role";
+GRANT SELECT ON TABLE "public"."send_log_entries" TO "authenticated";
+
+
+
+GRANT ALL ON SEQUENCE "public"."send_log_entries_id_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."send_recipients" TO "service_role";
+GRANT SELECT ON TABLE "public"."send_recipients" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."sends" TO "service_role";
+GRANT SELECT ON TABLE "public"."sends" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."share_links" TO "service_role";
+
+
+
+GRANT SELECT("id") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("brand_id") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("campaign_id") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("created_by") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("created_at") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("expires_at") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("revoked_at") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("failed_attempts") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT SELECT("locked_until") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON SEQUENCES TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON FUNCTIONS TO "service_role";
+
+
+
+
+
+
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "postgres";
+ALTER DEFAULT PRIVILEGES FOR ROLE "postgres" IN SCHEMA "public" GRANT ALL ON TABLES TO "service_role";
+
+
+
+
+
+
+

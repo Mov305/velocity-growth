@@ -12,6 +12,7 @@ The hiring team will: sign in as each of the six users both through the app and 
 ## Attack checklist
 
 **As an authenticated user of brand A:**
+
 - `select * from <every table>` with the anon key and A's JWT. Does anything from brand B come back? Check every table, view, and RPC in `supabase/migrations`. Views bypass RLS unless `security_invoker = on`.
 - Call every RPC with a `brand_id` or `campaign_id` belonging to brand B. Does it refuse, or does it trust the argument?
 - Insert or update a row with `brand_id` set to B. Is there a `WITH CHECK` clause?
@@ -19,17 +20,20 @@ The hiring team will: sign in as each of the six users both through the app and 
 - Sign in with a Google account that is not one of the six. Does a profile or membership get created? Does any page render?
 
 **On the send path:**
+
 - Two simultaneous calls to confirm the same send. Is there a database-level lock or unique constraint, or only an application `if` check?
 - Call the provider with a forged idempotency key. Is the key server-generated and stored first?
 - Is the provider API key reachable from the browser bundle, a public env var, a client component, or a log line?
 
 **On the shared link:**
+
 - Is the token at least 128 bits from a CSPRNG? Is the password hashed with bcrypt or argon2, never compared in plaintext or stored reversibly?
 - Does a correct password unlock exactly one campaign's results, with no contact-level PII? Can the response be altered by changing an id in the request?
 - Is there rate limiting or lockout on password attempts? Is the unlock state a signed, expiring cookie scoped to that one link?
 - Can a revoked or expired link still be read?
 
 **Everywhere:**
+
 - Service-role key used anywhere a user-scoped client would do. Each use must be justified in a comment.
 - Error responses that leak table names, stack traces, or the existence of another brand's data.
 - Input validation at the boundary (zod or equivalent) that allow-lists shapes rather than deny-listing strings.

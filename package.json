@@ -1,0 +1,51 @@
+{
+  "name": "velocity-growth-portal",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run --project unit",
+    "test:rls": "vitest run --project rls",
+    "db:start": "supabase start",
+    "db:stop": "supabase stop",
+    "db:reset": "supabase db reset",
+    "db:push": "supabase db push",
+    "db:types": "supabase gen types typescript --local --schema public,app > src/lib/supabase/database.types.ts",
+    "db:schema": "supabase db dump --local --schema public,app -f schema.sql",
+    "env:local": "tsx scripts/local-env.ts",
+    "seed:users": "tsx scripts/seed-users.ts"
+  },
+  "dependencies": {
+    "@supabase/ssr": "0",
+    "@supabase/supabase-js": "2",
+    "next": "16.3.5",
+    "react": "19.2.8",
+    "react-dom": "19.2.8",
+    "server-only": "^0.0.1",
+    "zod": "4"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^24.13.4",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@vitejs/plugin-react": "6",
+    "dotenv": "17",
+    "eslint": "^9",
+    "eslint-config-next": "16.3.5",
+    "postgres": "3",
+    "prettier": "3",
+    "supabase": "2",
+    "tailwindcss": "^4",
+    "tsx": "4",
+    "typescript": "^5",
+    "vitest": "5"
+  },
+  "packageManager": "pnpm@9.12.3"
+}
