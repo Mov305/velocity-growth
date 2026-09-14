@@ -1,0 +1,7 @@
+external_id,campaign_name,channel,target_country,reported_sent,reported_delivered,reported_bounced,reported_opens,reported_clicks,spend,sent_at_utc,send_local_time,parent_campaign_id
+KIL-9001,Fixture Promo,email,,10640,10108,532,12679,2291,650.07,2026-02-09T00:08:45Z,2026-02-09 03:08,
+KIL-9002,Fixture SMS,sms,KE,100,90,10,0,0,12.00,2026-03-01T10:00:00Z,2026-03-01 13:00,
+CMP-914,Fixture Child,email,,50,45,5,20,3,5.00,2026-04-09T14:13:33Z,2026-04-09 17:13,KIL-9001
+CMP-915,Fixture Orphan Child,email,,50,45,5,20,3,5.00,2026-04-09T14:13:33Z,2026-04-09 17:13,KAR-9999
+KIL-9002,Fixture SMS,sms,KE,100,90,10,0,0,12.00,2026-03-01T10:00:00Z,2026-03-01 13:00,
+KIL-9003,Fixture Bad Channel,push,,1,1,0,0,0,1.00,2026-03-01T10:00:00Z,2026-03-01 13:00,

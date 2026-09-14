@@ -1,0 +1,10 @@
+external_id,full_name,email,phone,country,city,signup_at,status,consent_marketing,deleted_at,suppressed_until,brand_code,notes
+CT-900000001,Simon Kamau,simon.fixture@vg-eval.test,0704279001,KE,Nakuru,2026-02-19T23:47:04Z,active,true,,,KILELE,fixture
+CT-900000002,First Version,first.fixture@vg-eval.test,254-731-694774,KEN,Nairobi,2026-03-10,ACTIVE,Y,,,KILELE,fixture
+CT-900000002,Second Version,second.fixture@vg-eval.test,+254 721 913 662,kenya,Nairobi,01/02/2026 00:10,Active,1,,2027-05-16T00:00:00Z,KILELE,fixture corrected
+external_id,full_name,email,phone,country,city,signup_at,status,consent_marketing,deleted_at,suppressed_until,brand_code,notes
+CT-900800184,Omar Benali,leak.kar.fixture@vg-eval.test,0719624399,ZA,Cape Town,2026-02-21T10:24:51Z,active,true,,,KAROO,fixture leak
+CT-900000003,Shifted Row,shifted.fixture@vg-eval.test,0712000000,ZZ,2026-02-01,active,true,,,KILELE,fixture
+CT-900000004,Bad Phone,badphone.fixture@vg-eval.test,2.54E+11,KE,Kisumu,2026-02-01T00:00:00Z,active,yes,,,KILELE,fixture
+CT-900000005,Bad Email,john doe@vg-eval.test,0704279002,KE,Kisumu,2026-02-01T00:00:00Z,unsubscribe,no,,,KILELE,fixture
+CT-900000006,,,0704279003,NULL,Nyeri,,pending,,,,,fixture

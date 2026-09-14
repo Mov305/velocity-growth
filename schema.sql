@@ -256,6 +256,7 @@ CREATE TABLE IF NOT EXISTS "public"."campaigns" (
     "source_import_id" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "campaigns_external_id_check" CHECK (("external_id" ~ '^[A-Z]{2,5}-[0-9]{3,6}$'::"text")),
     CONSTRAINT "campaigns_reported_bounced_check" CHECK ((("reported_bounced" IS NULL) OR ("reported_bounced" >= 0))),
     CONSTRAINT "campaigns_reported_clicks_check" CHECK ((("reported_clicks" IS NULL) OR ("reported_clicks" >= 0))),
     CONSTRAINT "campaigns_reported_delivered_check" CHECK ((("reported_delivered" IS NULL) OR ("reported_delivered" >= 0))),
@@ -311,7 +312,8 @@ CREATE TABLE IF NOT EXISTS "public"."engagement_events" (
     "raw_event_type" "text" NOT NULL,
     "channel" "public"."channel" NOT NULL,
     "occurred_at" timestamp with time zone NOT NULL,
-    "source_import_id" "uuid"
+    "source_import_id" "uuid",
+    CONSTRAINT "engagement_events_event_id_check" CHECK (("event_id" <> ''::"text"))
 );
 
 ALTER TABLE ONLY "public"."engagement_events" FORCE ROW LEVEL SECURITY;
@@ -371,7 +373,8 @@ CREATE TABLE IF NOT EXISTS "public"."imports" (
     "rows_skipped_duplicate" integer DEFAULT 0 NOT NULL,
     "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "finished_at" timestamp with time zone,
-    "error" "text"
+    "error" "text",
+    "rows_already_present" integer DEFAULT 0 NOT NULL
 );
 
 ALTER TABLE ONLY "public"."imports" FORCE ROW LEVEL SECURITY;
@@ -434,7 +437,8 @@ CREATE TABLE IF NOT EXISTS "public"."send_log_entries" (
     "attempt_no" integer NOT NULL,
     "source_import_id" "uuid",
     CONSTRAINT "send_log_entries_attempt_no_check" CHECK (("attempt_no" >= 1)),
-    CONSTRAINT "send_log_entries_recipient_count_check" CHECK (("recipient_count" >= 0))
+    CONSTRAINT "send_log_entries_recipient_count_check" CHECK (("recipient_count" >= 0)),
+    CONSTRAINT "send_log_entries_status_check" CHECK (("status" = ANY (ARRAY['sent'::"text", 'queued'::"text", 'failed'::"text", 'cancelled'::"text", 'partial'::"text"])))
 );
 
 ALTER TABLE ONLY "public"."send_log_entries" FORCE ROW LEVEL SECURITY;

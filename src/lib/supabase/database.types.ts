@@ -372,6 +372,7 @@ export type Database = {
           finished_at: string | null
           id: string
           kind: Database["public"]["Enums"]["import_kind"]
+          rows_already_present: number
           rows_read: number
           rows_rejected: number
           rows_skipped_duplicate: number
@@ -388,6 +389,7 @@ export type Database = {
           finished_at?: string | null
           id?: string
           kind: Database["public"]["Enums"]["import_kind"]
+          rows_already_present?: number
           rows_read?: number
           rows_rejected?: number
           rows_skipped_duplicate?: number
@@ -404,6 +406,7 @@ export type Database = {
           finished_at?: string | null
           id?: string
           kind?: Database["public"]["Enums"]["import_kind"]
+          rows_already_present?: number
           rows_read?: number
           rows_rejected?: number
           rows_skipped_duplicate?: number

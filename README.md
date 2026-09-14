@@ -4,7 +4,7 @@ A multi-tenant campaign portal for three brands on one Supabase database. Each b
 
 Brands: Kilele Rides (Kenya, ~81k contacts), Karoo Coaches (South Africa, ~12.5k), Marrakech Express (Morocco, ~930).
 
-> Status: stage 1 complete locally (schema, forced RLS, auth gate, six users, isolation suite). Not yet deployed. Sections marked **decision** are settled.
+> Status: stage 2 complete locally (schema, forced RLS, auth gate, six users, isolation suite, full seed imported twice). Not yet deployed. Sections marked **decision** are settled.
 
 ---
 
@@ -30,29 +30,64 @@ Eleven business rules from the brief, translated into what has to be true in the
 
 Measured on 13 Sep 2026 from the zip (SHA-256 verified). These shape the import rules.
 
-| Trap                                    | Where                                                                                                                                                            | Rule adopted                                                                                                                               |
-| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| Three column dialects                   | Karoo uses `Full Name`, `Email`, `External Id`; Marrakech uses `e_mail`, `mobile`, `pays` with `;` delimiter and `,` decimals; Kilele uses snake_case with a BOM | One canonical schema. Per-brand header alias map in the import config.                                                                     |
-| Windows-1252 encoding                   | Karoo contacts                                                                                                                                                   | Decode as UTF-8, fall back to cp1252 on failure, record encoding in the import row.                                                        |
-| Repeated header row mid-file            | Kilele contacts, row ~42k                                                                                                                                        | Reject rows whose id equals the header name.                                                                                               |
-| Column-shifted rows                     | 46 in Karoo, 15 in Marrakech (`country = ZZ`)                                                                                                                    | Reject: id fails the `CT-\d+` allow-list pattern.                                                                                          |
-| Rows tagged with another brand          | 312 `KAROO` rows inside the Kilele file (emails `leak.kar.*`), 88 `KILELE` rows inside Karoo                                                                     | The file's brand wins. Rows whose `brand_code` disagrees are rejected with reason `brand_code mismatch`. They never enter the other brand. |
-| Duplicate ids, some conflicting         | Kilele 2,778 ids appear twice, 368 with different values                                                                                                         | Last row in the file wins. Delta file applied after base. Recorded in `contacts.source_import_id`, which links to `imports.file_name`.     |
-| Cross-brand id collisions               | Kilele and Karoo share 12,407 external ids                                                                                                                       | Uniqueness is `(brand_id, external_id)`. Provider recipient id is our UUID, never the external id.                                         |
-| Eleven spellings of a boolean           | `true/1/TRUE/yes/Y` and `0/no/FALSE/false/f` plus empty                                                                                                          | Allow-list normaliser. Empty consent is `false` (no consent recorded). Anything else rejected.                                             |
-| Status variants                         | `active`, `ACTIVE`, `active `, `Active`, `unsubscribe`                                                                                                           | Trim, lowercase, map `unsubscribe` to `unsubscribed`. Allow-list: active, unsubscribed, bounced, pending.                                  |
-| Country variants                        | `KE`, `KEN`, `kenya`, `Kenya`, `ke `, `254`, `NULL`, `null`, `none`                                                                                              | Normalise to ISO-2 via allow-list map. `254`, `NULL`, `none` become null country, row kept, `notes` flagged.                               |
-| Three date formats                      | ISO, `YYYY-MM-DD`, `DD/MM/YYYY HH:MM`                                                                                                                            | Parse all three. Day-first for the slash form (Kenya locale). Unparseable dates reject the row.                                            |
-| Phones in scientific notation           | 44 Kilele rows like `2.54E+11`                                                                                                                                   | Reject with reason `phone corrupted by spreadsheet export`.                                                                                |
-| Invalid emails                          | 389 in Kilele (`john doe@`, `no-tld@vg-eval`, `double@@`)                                                                                                        | Row kept, email set null, flagged `email invalid`. Contact is not contactable by email.                                                    |
-| Duplicate campaigns                     | `CMP-014` and `KIL-0044` twice in Kilele                                                                                                                         | Last row wins on `(brand_id, external_id)`.                                                                                                |
-| Cross-brand campaign parent             | Karoo `CMP-014` has parent `KIL-0007`, a Kilele campaign                                                                                                         | Parent resolved within brand only. Unresolvable parent stored as text, not a foreign key, and flagged.                                     |
-| Orphan events                           | Marrakech has 633 events for 12 campaigns (MAR-0007 to MAR-0018) absent from its campaign file                                                                   | **Decision:** rejected with reason `unknown campaign <id>`, shown in the imports view. No placeholder campaigns are invented.              |
-| Duplicate event ids                     | 8,310 in Kilele, 4,735 in Karoo                                                                                                                                  | Uniqueness `(brand_id, event_id)`. Second occurrence skipped and counted.                                                                  |
-| Reported opens exceed delivered         | `KIL-0016`: 12,679 opens, 10,108 delivered                                                                                                                       | Reported figures are total events. Dashboard labels "reported by brand (total)" vs "observed in event log (unique contacts)".              |
-| Event log is a tenth of reported volume | Every brand                                                                                                                                                      | Two sources, both shown, both labelled. Neither is silently preferred.                                                                     |
-| Last 30 days of signups is nearly empty | Only the Kilele delta has August signups; Karoo and Marrakech have none after April                                                                              | Chart renders an explicit "no signups in this window" state with the date range shown.                                                     |
-| Send log retry                          | `BATCH-0003` appears three times                                                                                                                                 | Imported as three attempts of one batch. It is the seed's own idempotency example.                                                         |
+| Trap                                    | Where                                                                                                                                                            | Rule adopted                                                                                                                                             |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Three column dialects                   | Karoo uses `Full Name`, `Email`, `External Id`; Marrakech uses `e_mail`, `mobile`, `pays` with `;` delimiter and `,` decimals; Kilele uses snake_case with a BOM | One canonical schema. Per-brand header alias map in the import config.                                                                                   |
+| Windows-1252 encoding                   | Karoo contacts                                                                                                                                                   | Decode as UTF-8, fall back to cp1252 on failure, record encoding in the import row.                                                                      |
+| Repeated header row mid-file            | Kilele contacts, row ~42k                                                                                                                                        | Reject rows whose id equals the header name.                                                                                                             |
+| Column-shifted rows                     | 46 in Karoo, 15 in Marrakech (`country = ZZ`)                                                                                                                    | Reject: id fails the `CT-\d+` allow-list pattern.                                                                                                        |
+| Rows tagged with another brand          | 312 `KAROO` rows inside the Kilele file (emails `leak.kar.*`), 88 `KILELE` rows inside Karoo                                                                     | The file's brand wins. Rows whose `brand_code` disagrees are rejected with reason `brand_code mismatch`. They never enter the other brand.               |
+| Duplicate ids, some conflicting         | Kilele 2,778 ids appear twice, 368 with different values                                                                                                         | Last row in the file wins. Delta file applied after base. Recorded in `contacts.source_import_id`, which links to `imports.file_name`.                   |
+| Cross-brand id collisions               | Kilele and Karoo share 12,407 external ids                                                                                                                       | Uniqueness is `(brand_id, external_id)`. Provider recipient id is our UUID, never the external id.                                                       |
+| Eleven spellings of a boolean           | `true/1/TRUE/yes/Y` and `0/no/FALSE/false/f` plus empty                                                                                                          | Allow-list normaliser. Empty consent is `false` (no consent recorded). Anything else rejected.                                                           |
+| Status variants                         | `active`, `ACTIVE`, `active `, `Active`, `unsubscribe`                                                                                                           | Trim, lowercase, map `unsubscribe` to `unsubscribed`. Allow-list: active, unsubscribed, bounced, pending.                                                |
+| Country variants                        | `KE`, `KEN`, `kenya`, `Kenya`, `ke `, `254`, `NULL`, `null`, `none`                                                                                              | Normalise to ISO-2 via allow-list map. `254`, `NULL`, `none` become null country, row kept, `notes` flagged.                                             |
+| Three date formats                      | ISO, `YYYY-MM-DD`, `DD/MM/YYYY HH:MM`                                                                                                                            | Parse all three. Day-first for the slash form (Kenya locale). Unparseable dates reject the row.                                                          |
+| Phones in scientific notation           | 44 Kilele rows like `2.54E+11`                                                                                                                                   | Kept, phone set null, flagged `phone_corrupted`. Same rule as email: a bad optional field never drops a contact. Rejecting dropped 145 events with them. |
+| Invalid emails                          | 389 in Kilele (`john doe@`, `no-tld@vg-eval`, `double@@`)                                                                                                        | Row kept, email set null, flagged `email invalid`. Contact is not contactable by email.                                                                  |
+| Duplicate campaigns                     | `CMP-014` and `KIL-0044` twice in Kilele                                                                                                                         | Last row wins on `(brand_id, external_id)`.                                                                                                              |
+| Cross-brand campaign parent             | Karoo `CMP-014` has parent `KIL-0007`, a Kilele campaign                                                                                                         | Parent resolved within brand only. Unresolvable parent stored as text, not a foreign key, and flagged.                                                   |
+| Orphan events                           | Marrakech has 633 events for 12 campaigns (MAR-0007 to MAR-0018) absent from its campaign file                                                                   | **Decision:** rejected with reason `unknown campaign <id>`, shown in the imports view. No placeholder campaigns are invented.                            |
+| Duplicate event ids                     | 8,310 in Kilele, 4,735 in Karoo                                                                                                                                  | Uniqueness `(brand_id, event_id)`. Second occurrence skipped and counted.                                                                                |
+| Reported opens exceed delivered         | `KIL-0016`: 12,679 opens, 10,108 delivered                                                                                                                       | Reported figures are total events. Dashboard labels "reported by brand (total)" vs "observed in event log (unique contacts)".                            |
+| Event log is a tenth of reported volume | Every brand                                                                                                                                                      | Two sources, both shown, both labelled. Neither is silently preferred.                                                                                   |
+| Last 30 days of signups is nearly empty | Only the Kilele delta has August signups; Karoo and Marrakech have none after April                                                                              | Chart renders an explicit "no signups in this window" state with the date range shown.                                                                   |
+| Send log retry                          | `BATCH-0003` appears three times                                                                                                                                 | Imported as three attempts of one batch. It is the seed's own idempotency example.                                                                       |
+
+### 2.1 Measured import, local stack, 2026-09-14
+
+`pnpm import:seed --all` twice in a row after `pnpm db:reset`. Pass 2 columns show where the second run differs.
+
+| File                                 | Read    | Upserted | Rejected | Dup skipped | Encoding     | Pass 2 upserted | Pass 2 already present |
+| ------------------------------------ | ------- | -------- | -------- | ----------- | ------------ | --------------- | ---------------------- |
+| kilele-contacts.csv                  | 83,993  | 80,829   | 386      | 2,778       | utf-8        | 80,829          | 0                      |
+| kilele-contacts-delta-2026-09-01.csv | 4,180   | 4,180    | 0        | 0           | utf-8        | 4,180           | 0                      |
+| kilele-campaigns.csv                 | 46      | 44       | 0        | 2           | utf-8        | 44              | 0                      |
+| kilele-events.csv                    | 312,000 | 303,588  | 0        | 8,412       | utf-8        | 0               | 303,588                |
+| kilele-send-log.csv                  | 9       | 9        | 0        | 0           | utf-8        | 9               | 0                      |
+| karoo-contacts.csv                   | 13,042  | 12,406   | 134      | 502         | windows-1252 | 12,406          | 0                      |
+| karoo-campaigns.csv                  | 19      | 19       | 0        | 0           | utf-8        | 19              | 0                      |
+| karoo-events.csv                     | 74,000  | 69,100   | 0        | 4,900       | utf-8        | 0               | 69,100                 |
+| marrakech-contacts.csv               | 957     | 918      | 15       | 24          | utf-8        | 918             | 0                      |
+| marrakech-campaigns.csv              | 6       | 6        | 0        | 0           | utf-8        | 6               | 0                      |
+| marrakech-events.csv                 | 940     | 307      | 633      | 0           | utf-8        | 0               | 307                    |
+
+"Upserted" is rows written on that pass. On pass 2 contacts, campaigns and send-log rows are rewritten in place; events are immutable facts, so a known event id inserts nothing and is counted as "already present". For every file and pass, read = upserted + rejected + duplicates skipped + already present, and the integration test asserts that arithmetic. Row counts per brand are identical after both passes: Kilele 82,509 contacts (82,114 not deleted), 44 campaigns, 303,588 events; Karoo 12,406 contacts, 19 campaigns, 69,100 events; Marrakech 918 contacts, 6 campaigns, 307 events.
+
+Reject reasons, first pass:
+
+| File                   | Reason                                               | Rows |
+| ---------------------- | ---------------------------------------------------- | ---- |
+| kilele-contacts.csv    | brand_code mismatch: KAROO in KILELE file            | 312  |
+| kilele-contacts.csv    | row has 9 or 7 columns, expected 13                  | 70   |
+| kilele-contacts.csv    | full_name contains a NUL byte                        | 3    |
+| kilele-contacts.csv    | external_id malformed: external_id (repeated header) | 1    |
+| karoo-contacts.csv     | brand_code mismatch: KILELE in KAROO file            | 88   |
+| karoo-contacts.csv     | row has 9 or 7 columns, expected 13                  | 46   |
+| marrakech-contacts.csv | row has 9 or 7 columns, expected 13                  | 15   |
+| marrakech-events.csv   | unknown campaign MAR-0007 to MAR-0018                | 633  |
+
+Flags on kept Kilele contacts: `consent_missing` 9,484, `country_unrecognised` 2,673, `email_invalid` 1,383, `phone_corrupted` 44. The Karoo campaign `CMP-014` keeps `parent_external_id = KIL-0007` and is flagged `parent_unresolved`; it is never linked across brands. `BATCH-0003` in the send log is stored as attempts 1, 2 and 3.
 
 ## 3. Provider findings
 
@@ -162,7 +197,7 @@ Each stage is one commit, made only when asked.
 | ----- | -------------------------------------------------------------------------------------------------------------------------------- |
 | 0     | Claude harness: rules, agents, skills, settings. Done.                                                                           |
 | 1     | Scaffold app, Supabase project, migration with all tables, RLS, six users, RLS test suite. Done locally; hosted push in stage 7. |
-| 2     | Import pipeline: parsers, normalisers, rejects, run against the seed                                                             |
+| 2     | Import pipeline: parsers, normalisers, rejects, run against the seed. Done locally.                                              |
 | 3     | Auth (email and Google), layout, contacts and campaigns views, imports view                                                      |
 | 4     | Dashboard with definitions                                                                                                       |
 | 5     | Send flow, Edge Functions, polling, live provider verification                                                                   |
@@ -171,13 +206,37 @@ Each stage is one commit, made only when asked.
 
 ## 7. Decisions log
 
-| Date       | Decision                                                                                                  | Why                                                                                                                                                 |
-| ---------- | --------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-09-13 | Marrakech orphan events are rejected and reported, not given placeholder campaigns                        | The brief asks that the marketer sees what did not load and why. Inventing campaign rows the client never supplied would be a quietly wrong number. |
-| 2026-09-14 | Next.js App Router on Vercel, not Vite plus a separate Node API                                           | One deploy, one URL, secret-key code in the same repo as the UI. Matches the job's "modern React framework plus Node".                              |
-| 2026-09-14 | Import is a CLI run by the engineer, results stored in `imports` and `import_rejects` and shown in the UI | The brief supplies the files. An upload screen is scope the brief does not ask for.                                                                 |
-| 2026-09-14 | Provider dispatch and polling run in Supabase Edge Functions, scheduled by pg_cron                        | The provider key stays inside Supabase. The graders asked for function names and can inspect them with the project URL.                             |
+| Date       | Decision                                                                                                                                                            | Why                                                                                                                                                                        |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 2026-09-13 | Marrakech orphan events are rejected and reported, not given placeholder campaigns                                                                                  | The brief asks that the marketer sees what did not load and why. Inventing campaign rows the client never supplied would be a quietly wrong number.                        |
+| 2026-09-14 | Next.js App Router on Vercel, not Vite plus a separate Node API                                                                                                     | One deploy, one URL, secret-key code in the same repo as the UI. Matches the job's "modern React framework plus Node".                                                     |
+| 2026-09-14 | Import is a CLI run by the engineer, results stored in `imports` and `import_rejects` and shown in the UI                                                           | The brief supplies the files. An upload screen is scope the brief does not ask for.                                                                                        |
+| 2026-09-14 | Provider dispatch and polling run in Supabase Edge Functions, scheduled by pg_cron                                                                                  | The provider key stays inside Supabase. The graders asked for function names and can inspect them with the project URL.                                                    |
+| 2026-09-14 | Seed data lives in `data/seed/`, gitignored, fetched by `pnpm seed:fetch` which verifies the SHA-256 from the brief                                                 | 42 MB of CSV does not belong in git history; the hash makes the fetch trustworthy.                                                                                         |
+| 2026-09-14 | Import writes through the `postgres` driver with `DATABASE_URL`, one transaction per file                                                                           | Multi-row upserts and a real transaction. A crash leaves the `imports` row `failed` and nothing half-loaded.                                                               |
+| 2026-09-14 | Inside one file the last row for a key wins; across files the later file in the manifest wins                                                                       | Exports are regenerated top to bottom; the Kilele delta is marked "corrected in Sept export".                                                                              |
+| 2026-09-14 | A row containing a NUL byte is rejected naming the column, with the byte shown as `<NUL>` in the stored raw copy                                                    | Postgres cannot store NUL in text or jsonb. Three Kilele names carry one. Altering silently would hide it.                                                                 |
+| 2026-09-14 | A bad optional field (email, phone, country) nulls the field and flags the contact; only a broken id, wrong brand, missing status or unparseable date drops the row | Rejecting 44 contacts for a mangled phone also rejected their 145 events. Consistency beats severity.                                                                      |
+| 2026-09-14 | Import library lives in `scripts/import/`, not `src/`, and its packages are dev dependencies                                                                        | It uses `node:fs` and `csv-parse`. Keeping it out of the Next.js source tree makes it impossible for a page or server action to pull it into a runtime that cannot run it. |
+| 2026-09-14 | ISO timestamps are validated by component and stored exactly as given, not through `Date`                                                                           | `Date` truncates microseconds to milliseconds, which could reorder two events from the same millisecond. Postgres parses the string in full.                               |
+| 2026-09-14 | The import parse is whole-file and synchronous                                                                                                                      | Measured 16 s and a few hundred MB for 312,000 rows. Adequate for these exports; a streaming path is the next step past roughly a million rows.                            |
 
-## 8. AI tools
+## 8. Running it
+
+```
+pnpm db:start          # local Supabase (Docker)
+pnpm db:reset          # apply migrations and brands seed
+pnpm env:local         # write .env.test from the running stack
+pnpm seed:users        # six logins from SEED_LOGINS; passwords to .credentials.local.json
+pnpm seed:fetch        # download and verify the seed zip into data/seed/
+pnpm import:seed --all # load every file in scripts/import-manifest.ts, in order
+pnpm test              # unit
+pnpm test:rls          # isolation, auth gate and import suites against the local database
+pnpm db:schema         # regenerate schema.sql
+```
+
+One file at a time: `pnpm import:seed --brand KAROO --kind contacts --file data/seed/karoo-contacts.csv`. Every run writes an `imports` row and one `import_rejects` row per refused line, with the line number, the reason, and the raw values.
+
+## 9. AI tools
 
 Claude Code (Fable 5.1) with project-scoped agents for review, security review, testing and linting. Every generated change is run through those agents before the user decides whether to commit. All commits are authored by the engineer alone.

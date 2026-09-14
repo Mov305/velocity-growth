@@ -19,7 +19,9 @@
     "db:types": "supabase gen types typescript --local --schema public,app > src/lib/supabase/database.types.ts",
     "db:schema": "supabase db dump --local --schema public,app -f schema.sql",
     "env:local": "tsx scripts/local-env.ts",
-    "seed:users": "tsx scripts/seed-users.ts"
+    "seed:users": "tsx scripts/seed-users.ts",
+    "seed:fetch": "tsx scripts/fetch-seed.ts",
+    "import:seed": "tsx scripts/run-import.ts"
   },
   "dependencies": {
     "@supabase/ssr": "0",
@@ -32,10 +34,13 @@
   },
   "devDependencies": {
     "@tailwindcss/postcss": "^4",
+    "@types/adm-zip": "^0.5.8",
     "@types/node": "^24.13.4",
     "@types/react": "^19",
     "@types/react-dom": "^19",
     "@vitejs/plugin-react": "6",
+    "adm-zip": "^0.6.1",
+    "csv-parse": "7",
     "dotenv": "17",
     "eslint": "^9",
     "eslint-config-next": "16.3.5",
