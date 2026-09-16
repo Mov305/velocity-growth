@@ -787,6 +787,38 @@ export type Database = {
       }
     }
     Functions: {
+      approve_send: { Args: { p_campaign_id: string }; Returns: string }
+      begin_dispatch: {
+        Args: { p_send_id: string }
+        Returns: {
+          approved_at: string
+          approved_by: string
+          approved_count: number
+          audience_definition: string
+          brand_id: string
+          campaign_id: string
+          created_at: string
+          dispatch_started_at: string | null
+          dispatched_at: string | null
+          id: string
+          idempotency_key: string
+          last_error: string | null
+          last_polled_at: string | null
+          poll_complete: boolean
+          poll_cursor: string | null
+          provider_accepted: number | null
+          provider_batch_id: string | null
+          provider_rejected: number | null
+          status: Database["public"]["Enums"]["send_status"]
+          updated_at: string
+        }[]
+        SetofOptions: {
+          from: "*"
+          to: "sends"
+          isOneToOne: false
+          isSetofReturn: true
+        }
+      }
       campaign_performance: {
         Args: never
         Returns: {
@@ -810,6 +842,15 @@ export type Database = {
           spend: number
         }[]
       }
+      complete_dispatch: {
+        Args: {
+          p_accepted: string[]
+          p_batch_id: string
+          p_rejected: string[]
+          p_send_id: string
+        }
+        Returns: undefined
+      }
       contact_is_contactable: {
         Args: { c: Database["public"]["Tables"]["contacts"]["Row"] }
         Returns: boolean
@@ -823,6 +864,41 @@ export type Database = {
           deleted_customers: number
           not_contactable: number
           total_customers: number
+        }[]
+      }
+      fail_dispatch: {
+        Args: { p_error: string; p_send_id: string }
+        Returns: undefined
+      }
+      ingest_provider_events: {
+        Args: { p_events: Json; p_send_id: string }
+        Returns: {
+          duplicates: number
+          inserted: number
+          unknown_recipients: number
+        }[]
+      }
+      preview_send_audience: {
+        Args: { p_campaign_id: string }
+        Returns: {
+          audience_count: number
+          audience_definition: string
+        }[]
+      }
+      send_outcomes: {
+        Args: { p_send_id: string }
+        Returns: {
+          accepted: number
+          bounced: number
+          clicked: number
+          complained: number
+          delivered: number
+          events: number
+          opened: number
+          queued: number
+          rejected: number
+          total: number
+          unsubscribed: number
         }[]
       }
       signups_last_30_days: {

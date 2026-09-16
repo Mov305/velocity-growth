@@ -2,7 +2,13 @@ import path from 'node:path';
 import { defineConfig } from 'vitest/config';
 
 export default defineConfig({
-  resolve: { alias: { '@': path.resolve(__dirname, 'src') } },
+  resolve: {
+    alias: {
+      '@': path.resolve(__dirname, 'src'),
+      // Next replaces this with an empty module on the server; Vitest needs the same.
+      'server-only': path.resolve(__dirname, 'tests/stubs/server-only.ts'),
+    },
+  },
   test: {
     projects: [
       {
@@ -19,6 +25,15 @@ export default defineConfig({
           testTimeout: 30_000,
           hookTimeout: 60_000,
           fileParallelism: false,
+        },
+      },
+      {
+        extends: true,
+        test: {
+          name: 'live',
+          include: ['tests/live/**/*.test.ts'],
+          environment: 'node',
+          testTimeout: 120_000,
         },
       },
     ],

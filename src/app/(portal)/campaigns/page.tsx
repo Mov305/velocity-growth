@@ -1,4 +1,6 @@
 import type { Metadata } from 'next';
+import Link from 'next/link';
+import { getMembership } from '@/lib/auth/membership';
 import { createClient } from '@/lib/supabase/server';
 import { parseListParams } from '@/lib/params';
 import { listCampaigns } from '@/lib/queries/campaigns';
@@ -19,8 +21,9 @@ export const metadata: Metadata = { title: 'Campaigns' };
 
 export default async function CampaignsPage({ searchParams }: PageProps<'/campaigns'>) {
   const params = parseListParams(await searchParams);
-  const supabase = await createClient();
+  const [m, supabase] = await Promise.all([getMembership(), createClient()]);
   const page = await listCampaigns(supabase, params);
+  const isOwner = m?.role === 'owner';
 
   const href = (p: number) => {
     const s = new URLSearchParams();
@@ -94,6 +97,7 @@ export default async function CampaignsPage({ searchParams }: PageProps<'/campai
                 <TableHead className="text-right">Clicks</TableHead>
                 <TableHead className="text-right">Spend</TableHead>
                 <TableHead>Flags</TableHead>
+                <TableHead></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -132,6 +136,14 @@ export default async function CampaignsPage({ searchParams }: PageProps<'/campai
                   </TableCell>
                   <TableCell>
                     <Flags flags={c.flags} />
+                  </TableCell>
+                  <TableCell>
+                    <Link
+                      href={`/campaigns/${c.id}/send`}
+                      className="whitespace-nowrap font-mono text-xs underline-offset-2 hover:underline"
+                    >
+                      {isOwner ? 'Send' : 'Audience'}
+                    </Link>
                   </TableCell>
                 </TableRow>
               ))}

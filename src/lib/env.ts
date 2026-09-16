@@ -13,10 +13,20 @@ const publicSchema = z.object({
 const serverSchema = publicSchema.extend({
   SUPABASE_SERVICE_ROLE_KEY: z.string().min(1),
   DATABASE_URL: z.string().min(1),
-  PROVIDER_BASE_URL: z.url().refine((u) => new URL(u).protocol === 'https:', {
-    message: 'PROVIDER_BASE_URL must use https',
-  }),
+  PROVIDER_BASE_URL: z.url().refine(
+    (u) => {
+      const url = new URL(u);
+      // https everywhere; plain http only for a mock provider on this machine during tests.
+      return (
+        url.protocol === 'https:' ||
+        (url.protocol === 'http:' && ['127.0.0.1', 'localhost'].includes(url.hostname))
+      );
+    },
+    { message: 'PROVIDER_BASE_URL must use https' },
+  ),
   PROVIDER_API_KEY: z.string().min(1),
+  // Shared secret the scheduler sends to the poll route. Absent means polling is manual only.
+  POLL_SECRET: z.string().min(16).optional(),
 });
 
 export type PublicEnv = z.infer<typeof publicSchema>;

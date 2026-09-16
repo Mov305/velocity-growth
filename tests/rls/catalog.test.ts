@@ -106,6 +106,17 @@ describe('RLS catalog: the isolation guarantee cannot be removed without this fa
     expect(line).not.toMatch(/"app"/);
   });
 
+  it('definer functions the server calls are not executable by client roles', async () => {
+    const rows = await sql<{ routine_name: string; grantee: string }[]>`
+      select r.routine_name, r.grantee from information_schema.routine_privileges r
+      join pg_proc p on p.proname = r.routine_name
+      join pg_namespace n on n.oid = p.pronamespace and n.nspname = r.routine_schema
+      where r.routine_schema = 'public' and p.prosecdef
+        and r.grantee in ('anon', 'authenticated', 'PUBLIC')
+        and r.routine_name in ('complete_dispatch', 'fail_dispatch', 'ingest_provider_events')`;
+    expect(rows).toEqual([]);
+  });
+
   it('every view in public runs with security_invoker', async () => {
     const rows = await sql<{ relname: string; invoker: boolean }[]>`
       select c.relname,

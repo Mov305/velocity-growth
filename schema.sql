@@ -196,6 +196,130 @@ $$;
 ALTER FUNCTION "app"."user_brand_ids"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."approve_send"("p_campaign_id" "uuid") RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_brand uuid;
+  v_send uuid;
+  v_count integer;
+begin
+  select brand_id into v_brand from public.campaigns where id = p_campaign_id;
+  if v_brand is null or not app.is_owner_of(v_brand) then
+    raise exception 'not permitted: only an owner of the campaign''s brand can approve a send'
+      using errcode = '42501';
+  end if;
+
+  perform pg_advisory_xact_lock(hashtext('approve_send'), hashtext(p_campaign_id::text));
+
+  select id into v_send from public.sends
+  where campaign_id = p_campaign_id and brand_id = v_brand
+    and provider_batch_id is null
+    and status in ('approved', 'dispatching', 'failed')
+  order by approved_at desc limit 1;
+  if v_send is not null then
+    return v_send;
+  end if;
+
+  insert into public.sends (brand_id, campaign_id, status, audience_definition, approved_count, approved_by, idempotency_key)
+  values (
+    v_brand, p_campaign_id, 'approved',
+    'status active, consent given, not deleted, not suppressed, has an email or phone, and no bounce, complaint or unsubscribe in the event log or from a send',
+    0, auth.uid(), gen_random_uuid()::text
+  )
+  returning id into v_send;
+
+  insert into public.send_recipients (send_id, contact_id, brand_id, status)
+  select v_send, ct.id, v_brand, 'queued'
+  from public.contacts ct
+  where ct.brand_id = v_brand
+    and ct.deleted_at is null
+    and ct.status = 'active'
+    and ct.consent_marketing
+    and (ct.suppressed_until is null or ct.suppressed_until < now())
+    and (ct.email is not null or ct.phone is not null)
+    and not exists (
+      select 1 from public.engagement_events e
+      where e.brand_id = v_brand and e.contact_id = ct.id
+        and e.event_type in ('bounce', 'complaint', 'unsubscribe'))
+    and not exists (
+      select 1 from public.send_recipients r
+      where r.brand_id = v_brand and r.contact_id = ct.id
+        and r.status in ('bounced', 'complained', 'unsubscribed'));
+
+  get diagnostics v_count = row_count;
+  update public.sends set approved_count = v_count where id = v_send;
+  return v_send;
+end $$;
+
+
+ALTER FUNCTION "public"."approve_send"("p_campaign_id" "uuid") OWNER TO "postgres";
+
+SET default_tablespace = '';
+
+SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."sends" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "campaign_id" "uuid" NOT NULL,
+    "status" "public"."send_status" DEFAULT 'approved'::"public"."send_status" NOT NULL,
+    "audience_definition" "text" NOT NULL,
+    "approved_count" integer NOT NULL,
+    "approved_by" "uuid" NOT NULL,
+    "approved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "idempotency_key" "text" NOT NULL,
+    "dispatch_started_at" timestamp with time zone,
+    "dispatched_at" timestamp with time zone,
+    "provider_batch_id" "text",
+    "provider_accepted" integer,
+    "provider_rejected" integer,
+    "last_error" "text",
+    "poll_cursor" "text",
+    "last_polled_at" timestamp with time zone,
+    "poll_complete" boolean DEFAULT false NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "sends_approved_count_check" CHECK (("approved_count" >= 0))
+);
+
+ALTER TABLE ONLY "public"."sends" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."sends" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."begin_dispatch"("p_send_id" "uuid") RETURNS SETOF "public"."sends"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_brand uuid;
+begin
+  select brand_id into v_brand from public.sends where id = p_send_id;
+  if v_brand is null or not app.is_owner_of(v_brand) then
+    raise exception 'not permitted: only an owner of the send''s brand can dispatch it'
+      using errcode = '42501';
+  end if;
+  return query
+    update public.sends s
+    set status = 'dispatching', dispatch_started_at = now(), last_error = null
+    where s.id = p_send_id
+      and s.provider_batch_id is null
+      and (
+        s.status = 'approved'
+        or s.status = 'failed'
+        or (s.status = 'dispatching' and s.dispatch_started_at < now() - interval '5 minutes')
+      )
+    returning s.*;
+end $$;
+
+
+ALTER FUNCTION "public"."begin_dispatch"("p_send_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."campaign_performance"() RETURNS TABLE("id" "uuid", "external_id" "text", "name" "text", "channel" "public"."channel", "sent_at" timestamp with time zone, "reported_sent" integer, "reported_delivered" integer, "reported_bounced" integer, "reported_opens" integer, "reported_clicks" integer, "spend" numeric, "observed_contacts" integer, "observed_opened" integer, "observed_clicked" integer, "observed_bounced" integer, "observed_complained" integer, "observed_unsubscribed" integer, "observed_events" integer)
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
@@ -226,9 +350,25 @@ $$;
 
 ALTER FUNCTION "public"."campaign_performance"() OWNER TO "postgres";
 
-SET default_tablespace = '';
 
-SET default_table_access_method = "heap";
+CREATE OR REPLACE FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+begin
+  update public.send_recipients set status = 'accepted'
+  where send_id = p_send_id and contact_id = any(p_accepted) and status = 'queued';
+  update public.send_recipients set status = 'rejected'
+  where send_id = p_send_id and contact_id = any(p_rejected) and status = 'queued';
+  update public.sends
+  set status = 'dispatched', dispatched_at = now(), provider_batch_id = p_batch_id,
+      provider_accepted = coalesce(array_length(p_accepted, 1), 0),
+      provider_rejected = coalesce(array_length(p_rejected, 1), 0)
+  where id = p_send_id and status = 'dispatching';
+end $$;
+
+
+ALTER FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."contacts" (
@@ -346,6 +486,149 @@ $$;
 
 
 ALTER FUNCTION "public"."dashboard_summary"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fail_dispatch"("p_send_id" "uuid", "p_error" "text") RETURNS "void"
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  update public.sends set status = 'failed', last_error = left(p_error, 500)
+  where id = p_send_id and status = 'dispatching' and provider_batch_id is null
+$$;
+
+
+ALTER FUNCTION "public"."fail_dispatch"("p_send_id" "uuid", "p_error" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_events" "jsonb") RETURNS TABLE("inserted" integer, "duplicates" integer, "unknown_recipients" integer)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_brand uuid;
+  v_inserted integer := 0;
+  v_dups integer := 0;
+  v_unknown integer := 0;
+  ev jsonb;
+  v_event_id text;
+  v_type text;
+  v_recipient uuid;
+  v_occurred timestamptz;
+  v_new public.recipient_status;
+  forward constant public.recipient_status[] := array['queued','rejected','accepted','delivered','opened','clicked']::public.recipient_status[];
+begin
+  select brand_id into v_brand from public.sends where id = p_send_id;
+  if v_brand is null then
+    raise exception 'send not found' using errcode = 'P0002';
+  end if;
+
+  for ev in select * from jsonb_array_elements(p_events) loop
+    v_event_id := coalesce(ev->>'event_id', ev->>'id');
+    v_type := lower(coalesce(ev->>'type', ev->>'event_type', ev->>'event', ''));
+    begin
+      v_occurred := nullif(coalesce(ev->>'occurred_at', ev->>'timestamp', ev->>'at', ev->>'created_at'), '')::timestamptz;
+    exception when others then
+      v_occurred := null;
+    end;
+    begin
+      v_recipient := nullif(coalesce(ev->>'recipient_id', ev->>'recipient', ev->>'contact_id', ev->'recipient'->>'id'), '')::uuid;
+    exception when others then
+      v_recipient := null;
+    end;
+    if v_event_id is null then
+      continue;
+    end if;
+
+    if v_recipient is not null and not exists (
+      select 1 from public.send_recipients r where r.send_id = p_send_id and r.contact_id = v_recipient
+    ) then
+      v_recipient := null;
+    end if;
+
+    insert into public.provider_events (brand_id, send_id, provider_event_id, event_type, recipient_id, occurred_at, raw)
+    values (v_brand, p_send_id, v_event_id, v_type, v_recipient, v_occurred, ev)
+    on conflict (send_id, provider_event_id) do nothing;
+    if not found then
+      v_dups := v_dups + 1;
+      continue;
+    end if;
+    v_inserted := v_inserted + 1;
+
+    if v_recipient is null then
+      v_unknown := v_unknown + 1;
+      continue;
+    end if;
+
+    v_new := case v_type
+      when 'delivered' then 'delivered'::public.recipient_status
+      when 'opened' then 'opened'
+      when 'open' then 'opened'
+      when 'clicked' then 'clicked'
+      when 'click' then 'clicked'
+      when 'bounced' then 'bounced'
+      when 'bounce' then 'bounced'
+      when 'complained' then 'complained'
+      when 'complaint' then 'complained'
+      when 'unsubscribed' then 'unsubscribed'
+      when 'unsubscribe' then 'unsubscribed'
+      else null end;
+    if v_new is null then
+      continue;
+    end if;
+
+    update public.send_recipients r
+    set status = v_new, last_event_at = greatest(coalesce(r.last_event_at, v_occurred), v_occurred)
+    where r.send_id = p_send_id and r.contact_id = v_recipient
+      and r.status not in ('bounced', 'complained', 'unsubscribed')
+      and (
+        v_new in ('bounced', 'complained', 'unsubscribed')
+        or array_position(forward, v_new) > array_position(forward, r.status)
+      );
+  end loop;
+
+  update public.sends set last_polled_at = now() where id = p_send_id;
+  return query select v_inserted, v_dups, v_unknown;
+end $$;
+
+
+ALTER FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_events" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") RETURNS TABLE("audience_count" integer, "audience_definition" "text")
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  select
+    (select count(*)::int from public.contactable_contact_ids()) as audience_count,
+    'status active, consent given, not deleted, not suppressed, has an email or phone, and no bounce, complaint or unsubscribe in the event log or from a send' as audience_definition
+  from public.campaigns c where c.id = p_campaign_id
+$$;
+
+
+ALTER FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS TABLE("queued" integer, "accepted" integer, "rejected" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "total" integer, "events" integer)
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  select
+    count(*) filter (where status = 'queued')::int,
+    count(*) filter (where status = 'accepted')::int,
+    count(*) filter (where status = 'rejected')::int,
+    count(*) filter (where status = 'delivered')::int,
+    count(*) filter (where status = 'opened')::int,
+    count(*) filter (where status = 'clicked')::int,
+    count(*) filter (where status = 'bounced')::int,
+    count(*) filter (where status = 'complained')::int,
+    count(*) filter (where status = 'unsubscribed')::int,
+    count(*)::int,
+    (select count(*)::int from public.provider_events e where e.send_id = p_send_id)
+  from public.send_recipients r where r.send_id = p_send_id
+$$;
+
+
+ALTER FUNCTION "public"."send_outcomes"("p_send_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."signups_last_30_days"() RETURNS TABLE("day" "date", "signups" integer)
@@ -626,36 +909,6 @@ ALTER TABLE ONLY "public"."send_recipients" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."send_recipients" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."sends" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "brand_id" "uuid" NOT NULL,
-    "campaign_id" "uuid" NOT NULL,
-    "status" "public"."send_status" DEFAULT 'approved'::"public"."send_status" NOT NULL,
-    "audience_definition" "text" NOT NULL,
-    "approved_count" integer NOT NULL,
-    "approved_by" "uuid" NOT NULL,
-    "approved_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "idempotency_key" "text" NOT NULL,
-    "dispatch_started_at" timestamp with time zone,
-    "dispatched_at" timestamp with time zone,
-    "provider_batch_id" "text",
-    "provider_accepted" integer,
-    "provider_rejected" integer,
-    "last_error" "text",
-    "poll_cursor" "text",
-    "last_polled_at" timestamp with time zone,
-    "poll_complete" boolean DEFAULT false NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "sends_approved_count_check" CHECK (("approved_count" >= 0))
-);
-
-ALTER TABLE ONLY "public"."sends" FORCE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."sends" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."share_links" (
@@ -1117,9 +1370,31 @@ GRANT ALL ON FUNCTION "app"."user_brand_ids"() TO "authenticated";
 
 
 
+REVOKE ALL ON FUNCTION "public"."approve_send"("p_campaign_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."approve_send"("p_campaign_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."approve_send"("p_campaign_id" "uuid") TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."sends" TO "service_role";
+GRANT SELECT ON TABLE "public"."sends" TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."begin_dispatch"("p_send_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."begin_dispatch"("p_send_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."begin_dispatch"("p_send_id" "uuid") TO "authenticated";
+
+
+
 REVOKE ALL ON FUNCTION "public"."campaign_performance"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."campaign_performance"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."campaign_performance"() TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) TO "service_role";
 
 
 
@@ -1142,6 +1417,28 @@ GRANT ALL ON FUNCTION "public"."contactable_contact_ids"() TO "authenticated";
 REVOKE ALL ON FUNCTION "public"."dashboard_summary"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."dashboard_summary"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."dashboard_summary"() TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."fail_dispatch"("p_send_id" "uuid", "p_error" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."fail_dispatch"("p_send_id" "uuid", "p_error" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_events" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_events" "jsonb") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."send_outcomes"("p_send_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."send_outcomes"("p_send_id" "uuid") TO "service_role";
+GRANT ALL ON FUNCTION "public"."send_outcomes"("p_send_id" "uuid") TO "authenticated";
 
 
 
@@ -1218,11 +1515,6 @@ GRANT ALL ON SEQUENCE "public"."send_log_entries_id_seq" TO "service_role";
 
 GRANT ALL ON TABLE "public"."send_recipients" TO "service_role";
 GRANT SELECT ON TABLE "public"."send_recipients" TO "authenticated";
-
-
-
-GRANT ALL ON TABLE "public"."sends" TO "service_role";
-GRANT SELECT ON TABLE "public"."sends" TO "authenticated";
 
 
 

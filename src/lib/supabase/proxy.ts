@@ -3,7 +3,9 @@ import { NextResponse, type NextRequest } from 'next/server';
 import { publicEnv } from '@/lib/env';
 
 /** Paths a signed-out visitor may reach. Everything else redirects to /login. */
-const PUBLIC_PREFIXES = ['/login', '/auth/', '/share/', '/no-access'];
+// /api/ routes carry their own authentication (the poll route checks a shared secret); a session
+// redirect there would turn every scheduler call into a 307 to the login page.
+const PUBLIC_PREFIXES = ['/login', '/auth/', '/share/', '/no-access', '/api/'];
 
 function isPublic(pathname: string) {
   return PUBLIC_PREFIXES.some(
