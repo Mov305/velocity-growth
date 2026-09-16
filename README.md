@@ -4,7 +4,7 @@ A multi-tenant campaign portal for three brands on one Supabase database. Each b
 
 Brands: Kilele Rides (Kenya, ~81k contacts), Karoo Coaches (South Africa, ~12.5k), Marrakech Express (Morocco, ~930).
 
-> Status: stage 3 in progress (sign-in, brand shell, contacts, campaigns, imports views). Hosted Supabase project created and migrated; app not yet deployed. Sections marked **decision** are settled.
+> Status: stage 4 (dashboard) built. Hosted Supabase project migrated, seeded and loaded with the full data; Google sign-in configured; app not yet deployed. Sections marked **decision** are settled.
 
 ---
 
@@ -198,8 +198,8 @@ Each stage is one commit, made only when asked.
 | 0     | Claude harness: rules, agents, skills, settings. Done.                                                                           |
 | 1     | Scaffold app, Supabase project, migration with all tables, RLS, six users, RLS test suite. Done locally; hosted push in stage 7. |
 | 2     | Import pipeline: parsers, normalisers, rejects, run against the seed. Done locally.                                              |
-| 3     | Auth (email and Google), layout, contacts and campaigns views, imports view. Built; e2e pending Docker.                          |
-| 4     | Dashboard with definitions                                                                                                       |
+| 3     | Auth (email and Google), layout, contacts and campaigns views, imports view. Done.                                               |
+| 4     | Dashboard with definitions. Built.                                                                                               |
 | 5     | Send flow, Edge Functions, polling, live provider verification                                                                   |
 | 6     | Shared results link                                                                                                              |
 | 7     | Mobile pass, states, `schema.sql`, deploy, submission note                                                                       |
@@ -231,6 +231,12 @@ Each stage is one commit, made only when asked.
 | 2026-09-15 | The error boundary shows a retry and a digest reference, never the raw database message                                                                                   | Raw PostgREST text names tables. The full message stays in the server log.                                                                                                                                        |
 | 2026-09-15 | Security headers on every response: CSP with `frame-ancestors 'none'`, nosniff, strict referrer; the sign-out route refuses a foreign Origin                              | Defence in depth around a page that renders values copied from client CSV files.                                                                                                                                  |
 | 2026-09-15 | The Google redirect origin comes from the browser's Origin header or `NEXT_PUBLIC_SITE_URL`, never from `x-forwarded-host`; `%` and `_` in search are escaped as literals | A proxy can forge forwarded headers; a wildcard in a search box is a typo, not a pattern.                                                                                                                         |
+| 2026-09-16 | Dashboard numbers come from four `security invoker` SQL functions; the page computes nothing                                                                              | One definition per number, computed once in the database under the caller's RLS, tested against an independent superuser count per brand.                                                                         |
+| 2026-09-16 | `dashboard_summary` is set-based with the contactable exclusion as a `not exists` in a `where` clause, never inside a `filter`                                            | Measured as the authenticated role on Kilele: per-row function 8 s timeout, `not exists` inside `count(*) filter` 44 s, anti-join form 139 ms. Same numbers each time: 82,114 / 395 / 35,502.                     |
+| 2026-09-16 | Contactable has one definition in SQL, exposed as a count for the dashboard and as `contactable_contact_ids()` for the send audience                                      | The number a marketer approves on the send screen must be the number the dashboard shows.                                                                                                                         |
+| 2026-09-16 | The 30-day signups chart is one series, one hue, inline SVG with a per-day tooltip and a table view; thirty zeros render as an explicit empty state                       | Karoo and Marrakech have no signups in the window. A blank chart would look broken; the message says why.                                                                                                         |
+| 2026-09-16 | Campaign performance shows reported totals and observed distinct contacts side by side and does not reconcile them                                                        | They differ by an order of magnitude in the seed data. Choosing one silently would be a quietly wrong number.                                                                                                     |
+| 2026-09-16 | `contact_is_contactable(row)` is not callable as an RPC; only `contactable_contact_ids()` and `dashboard_summary()` are                                                   | Called with a crafted row for a contact the caller cannot see, the row function answered vacuously. Nothing leaked, but a function that can answer wrongly is not exposed.                                        |
 
 ## 8. Running it
 

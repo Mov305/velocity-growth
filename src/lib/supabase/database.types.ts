@@ -787,7 +787,51 @@ export type Database = {
       }
     }
     Functions: {
-      [_ in never]: never
+      campaign_performance: {
+        Args: never
+        Returns: {
+          channel: Database["public"]["Enums"]["channel"]
+          external_id: string
+          id: string
+          name: string
+          observed_bounced: number
+          observed_clicked: number
+          observed_complained: number
+          observed_contacts: number
+          observed_events: number
+          observed_opened: number
+          observed_unsubscribed: number
+          reported_bounced: number
+          reported_clicks: number
+          reported_delivered: number
+          reported_opens: number
+          reported_sent: number
+          sent_at: string
+          spend: number
+        }[]
+      }
+      contact_is_contactable: {
+        Args: { c: Database["public"]["Tables"]["contacts"]["Row"] }
+        Returns: boolean
+      }
+      contactable_contact_ids: { Args: never; Returns: string[] }
+      dashboard_summary: {
+        Args: never
+        Returns: {
+          contactable: number
+          contactable_definition: string
+          deleted_customers: number
+          not_contactable: number
+          total_customers: number
+        }[]
+      }
+      signups_last_30_days: {
+        Args: never
+        Returns: {
+          day: string
+          signups: number
+        }[]
+      }
     }
     Enums: {
       channel: "email" | "sms"

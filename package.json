@@ -17,7 +17,7 @@
     "db:stop": "supabase stop",
     "db:reset": "supabase db reset",
     "db:push": "supabase db push",
-    "db:types": "supabase gen types typescript --local --schema public,app > src/lib/supabase/database.types.ts",
+    "db:types": "tsx scripts/gen-types.ts",
     "db:schema": "supabase db dump --local --schema public,app -f schema.sql",
     "env:local": "tsx scripts/local-env.ts",
     "seed:users": "tsx scripts/seed-users.ts",

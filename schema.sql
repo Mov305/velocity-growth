@@ -195,9 +195,183 @@ $$;
 
 ALTER FUNCTION "app"."user_brand_ids"() OWNER TO "postgres";
 
+
+CREATE OR REPLACE FUNCTION "public"."campaign_performance"() RETURNS TABLE("id" "uuid", "external_id" "text", "name" "text", "channel" "public"."channel", "sent_at" timestamp with time zone, "reported_sent" integer, "reported_delivered" integer, "reported_bounced" integer, "reported_opens" integer, "reported_clicks" integer, "spend" numeric, "observed_contacts" integer, "observed_opened" integer, "observed_clicked" integer, "observed_bounced" integer, "observed_complained" integer, "observed_unsubscribed" integer, "observed_events" integer)
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  select
+    c.id, c.external_id, c.name, c.channel, c.sent_at,
+    coalesce(c.reported_sent, 0), coalesce(c.reported_delivered, 0), coalesce(c.reported_bounced, 0),
+    coalesce(c.reported_opens, 0), coalesce(c.reported_clicks, 0),
+    coalesce(c.spend, 0),
+    coalesce(o.contacts, 0), coalesce(o.opened, 0), coalesce(o.clicked, 0), coalesce(o.bounced, 0),
+    coalesce(o.complained, 0), coalesce(o.unsubscribed, 0), coalesce(o.events, 0)
+  from public.campaigns c
+  left join lateral (
+    select
+      count(distinct e.contact_id)::int as contacts,
+      count(distinct e.contact_id) filter (where e.event_type = 'open')::int as opened,
+      count(distinct e.contact_id) filter (where e.event_type = 'click')::int as clicked,
+      count(distinct e.contact_id) filter (where e.event_type = 'bounce')::int as bounced,
+      count(distinct e.contact_id) filter (where e.event_type = 'complaint')::int as complained,
+      count(distinct e.contact_id) filter (where e.event_type = 'unsubscribe')::int as unsubscribed,
+      count(*)::int as events
+    from public.engagement_events e
+    where e.campaign_id = c.id
+  ) o on true
+  order by c.sent_at desc nulls last, c.external_id
+$$;
+
+
+ALTER FUNCTION "public"."campaign_performance"() OWNER TO "postgres";
+
 SET default_tablespace = '';
 
 SET default_table_access_method = "heap";
+
+
+CREATE TABLE IF NOT EXISTS "public"."contacts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "external_id" "text" NOT NULL,
+    "full_name" "text",
+    "email" "text",
+    "phone" "text",
+    "country" "text",
+    "city" "text",
+    "signup_at" timestamp with time zone,
+    "status" "public"."contact_status" NOT NULL,
+    "consent_marketing" boolean NOT NULL,
+    "deleted_at" timestamp with time zone,
+    "suppressed_until" timestamp with time zone,
+    "notes" "text",
+    "flags" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "source_import_id" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "contacts_country_check" CHECK ((("country" IS NULL) OR ("country" ~ '^[A-Z]{2}$'::"text"))),
+    CONSTRAINT "contacts_email_check" CHECK ((("email" IS NULL) OR ("email" ~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'::"text"))),
+    CONSTRAINT "contacts_external_id_check" CHECK (("external_id" ~ '^CT-[0-9]+$'::"text"))
+);
+
+ALTER TABLE ONLY "public"."contacts" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."contacts" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."contact_is_contactable"("c" "public"."contacts") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  select c.status = 'active'
+     and c.consent_marketing
+     and c.deleted_at is null
+     and (c.suppressed_until is null or c.suppressed_until < now())
+     and (c.email is not null or c.phone is not null)
+     and not exists (
+       select 1 from public.engagement_events e
+       where e.contact_id = c.id and e.event_type in ('bounce', 'complaint', 'unsubscribe')
+     )
+     and not exists (
+       select 1 from public.send_recipients r
+       where r.contact_id = c.id and r.status in ('bounced', 'complained', 'unsubscribed')
+     )
+$$;
+
+
+ALTER FUNCTION "public"."contact_is_contactable"("c" "public"."contacts") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."contactable_contact_ids"() RETURNS SETOF "uuid"
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  with excluded as (
+    select e.contact_id from public.engagement_events e
+    where e.event_type in ('bounce', 'complaint', 'unsubscribe')
+    union
+    select r.contact_id from public.send_recipients r
+    where r.status in ('bounced', 'complained', 'unsubscribed')
+  )
+  select ct.id from public.contacts ct
+  where ct.deleted_at is null
+    and ct.status = 'active'
+    and ct.consent_marketing
+    and (ct.suppressed_until is null or ct.suppressed_until < now())
+    and (ct.email is not null or ct.phone is not null)
+    and not exists (select 1 from excluded x where x.contact_id = ct.id)
+$$;
+
+
+ALTER FUNCTION "public"."contactable_contact_ids"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."dashboard_summary"() RETURNS TABLE("total_customers" integer, "deleted_customers" integer, "contactable" integer, "not_contactable" integer, "contactable_definition" "text")
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  with excluded as (
+    select e.contact_id from public.engagement_events e
+    where e.event_type in ('bounce', 'complaint', 'unsubscribe')
+    union
+    select r.contact_id from public.send_recipients r
+    where r.status in ('bounced', 'complained', 'unsubscribed')
+  ),
+  totals as (
+    select
+      count(*) filter (where deleted_at is null)::int as total_customers,
+      count(*) filter (where deleted_at is not null)::int as deleted_customers
+    from public.contacts
+  ),
+  reachable as (
+    select count(*)::int as contactable
+    from public.contacts ct
+    where ct.deleted_at is null
+      and ct.status = 'active'
+      and ct.consent_marketing
+      and (ct.suppressed_until is null or ct.suppressed_until < now())
+      and (ct.email is not null or ct.phone is not null)
+      and not exists (select 1 from excluded x where x.contact_id = ct.id)
+  )
+  select
+    t.total_customers,
+    t.deleted_customers,
+    r.contactable,
+    t.total_customers - r.contactable as not_contactable,
+    'status active, consent given, not deleted, not suppressed, has an email or phone, and no bounce, complaint or unsubscribe in the event log or from a send' as contactable_definition
+  from totals t, reachable r
+$$;
+
+
+ALTER FUNCTION "public"."dashboard_summary"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."signups_last_30_days"() RETURNS TABLE("day" "date", "signups" integer)
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    SET "TimeZone" TO 'UTC'
+    AS $$
+  with days as (
+    select d::date as day
+    from generate_series((current_date - 29)::timestamp, current_date::timestamp, interval '1 day') as d
+  ),
+  counts as (
+    select (c.signup_at at time zone 'UTC')::date as day, count(*)::int as signups
+    from public.contacts c
+    where c.deleted_at is null
+      and c.signup_at >= (current_date - 29)::timestamp at time zone 'UTC'
+      and c.signup_at < (current_date + 1)::timestamp at time zone 'UTC'
+    group by 1
+  )
+  select days.day, coalesce(counts.signups, 0) as signups
+  from days left join counts on counts.day = days.day
+  order by days.day
+$$;
+
+
+ALTER FUNCTION "public"."signups_last_30_days"() OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."allowed_emails" (
@@ -270,36 +444,6 @@ ALTER TABLE ONLY "public"."campaigns" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."campaigns" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."contacts" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "brand_id" "uuid" NOT NULL,
-    "external_id" "text" NOT NULL,
-    "full_name" "text",
-    "email" "text",
-    "phone" "text",
-    "country" "text",
-    "city" "text",
-    "signup_at" timestamp with time zone,
-    "status" "public"."contact_status" NOT NULL,
-    "consent_marketing" boolean NOT NULL,
-    "deleted_at" timestamp with time zone,
-    "suppressed_until" timestamp with time zone,
-    "notes" "text",
-    "flags" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
-    "source_import_id" "uuid",
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "contacts_country_check" CHECK ((("country" IS NULL) OR ("country" ~ '^[A-Z]{2}$'::"text"))),
-    CONSTRAINT "contacts_email_check" CHECK ((("email" IS NULL) OR ("email" ~* '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'::"text"))),
-    CONSTRAINT "contacts_external_id_check" CHECK (("external_id" ~ '^CT-[0-9]+$'::"text"))
-);
-
-ALTER TABLE ONLY "public"."contacts" FORCE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."contacts" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."engagement_events" (
@@ -973,6 +1117,40 @@ GRANT ALL ON FUNCTION "app"."user_brand_ids"() TO "authenticated";
 
 
 
+REVOKE ALL ON FUNCTION "public"."campaign_performance"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."campaign_performance"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."campaign_performance"() TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."contacts" TO "service_role";
+GRANT SELECT ON TABLE "public"."contacts" TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."contact_is_contactable"("c" "public"."contacts") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."contact_is_contactable"("c" "public"."contacts") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."contactable_contact_ids"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."contactable_contact_ids"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."contactable_contact_ids"() TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."dashboard_summary"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."dashboard_summary"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."dashboard_summary"() TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."signups_last_30_days"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."signups_last_30_days"() TO "service_role";
+GRANT ALL ON FUNCTION "public"."signups_last_30_days"() TO "authenticated";
+
+
+
 GRANT ALL ON TABLE "public"."allowed_emails" TO "service_role";
 
 
@@ -984,11 +1162,6 @@ GRANT SELECT ON TABLE "public"."brands" TO "authenticated";
 
 GRANT ALL ON TABLE "public"."campaigns" TO "service_role";
 GRANT SELECT ON TABLE "public"."campaigns" TO "authenticated";
-
-
-
-GRANT ALL ON TABLE "public"."contacts" TO "service_role";
-GRANT SELECT ON TABLE "public"."contacts" TO "authenticated";
 
 
 
