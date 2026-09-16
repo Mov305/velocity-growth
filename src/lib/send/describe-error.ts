@@ -5,6 +5,14 @@
 export function describeSendError(raw: string | null | undefined): string | null {
   if (!raw) return null;
   const m = raw.match(/HTTP (\d{3})/);
+  if (/^poll:/.test(raw)) {
+    const batches = raw.match(/(\d+) of (\d+) batches did not answer/);
+    const what = batches
+      ? `${batches[1]} of ${batches[2]} provider batches did not answer`
+      : 'The last feedback fetch did not complete';
+    const why = m ? ` (HTTP ${m[1]} from the provider's feedback endpoint)` : '';
+    return `${what}${why}. Nothing about the send changed; feedback is fetched again every minute, the batches waiting longest first.`;
+  }
   if (/provider (dispatch|events) failed/.test(raw) && m) {
     return `The messaging provider answered HTTP ${m[1]}. Nothing was sent; it can be retried.`;
   }
@@ -14,8 +22,6 @@ export function describeSendError(raw: string | null | undefined): string | null
   if (/timeout|aborted|fetch failed|ECONN|ENOTFOUND/i.test(raw)) {
     return 'The messaging provider could not be reached. Nothing was sent; it can be retried.';
   }
-  if (/^poll:/.test(raw))
-    return 'The last feedback poll did not complete. It runs again every minute.';
   if (/interrupted/.test(raw)) return 'The process ended before finishing.';
   return 'An internal error was recorded. The engineer can read the detail in the send row.';
 }

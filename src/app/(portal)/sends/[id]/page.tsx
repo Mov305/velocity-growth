@@ -11,6 +11,8 @@ import { describeSendError } from '@/lib/send/describe-error';
 import { SendControls } from './send-controls';
 
 export const metadata: Metadata = { title: 'Send' };
+// The poll-now action walks provider batches under a time budget; this is the platform ceiling.
+export const maxDuration = 60;
 
 const STATUS_TEXT: Record<string, string> = {
   approved: 'Approved, not sent. The audience and count below are frozen.',

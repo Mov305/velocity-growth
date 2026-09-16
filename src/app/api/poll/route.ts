@@ -5,6 +5,8 @@ import { pollAllDispatched } from '@/lib/send/poll';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
+// One run walks many provider batches under POLL_RUN_BUDGET_MS; this is the platform ceiling.
+export const maxDuration = 60;
 
 function secretMatches(given: string | null, expected: string): boolean {
   if (!given || given.length !== expected.length) return false;
@@ -27,6 +29,9 @@ export async function POST(request: NextRequest) {
   const results = await pollAllDispatched();
   return NextResponse.json({
     polled: results.length,
+    batches: results.reduce((n, r) => n + r.polled, 0),
+    deferred: results.reduce((n, r) => n + r.deferred, 0),
+    failed: results.reduce((n, r) => n + r.failed, 0),
     inserted: results.reduce((n, r) => n + r.inserted, 0),
     errors: results.filter((r) => r.error).map((r) => ({ sendId: r.sendId, error: r.error })),
   });

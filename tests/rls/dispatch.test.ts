@@ -16,6 +16,8 @@ let failNext = false;
 /** Fail the nth POST from now (1-based) once; simulates a crash between chunks. */
 let failAtCall: number | null = null;
 const CAP = 500;
+/** Batch ids whose events endpoint answers 503 once, the way the live one did mid-walk. */
+const failEventsFor = new Set<string>();
 let server: Server;
 let baseUrl = '';
 const batches = new Map<string, { id: string; recipients: string[] }>();
@@ -65,6 +67,17 @@ function startMock(): Promise<void> {
         }
         const m = url.pathname.match(/^\/v1\/messages\/([^/]+)\/events$/);
         if (req.method === 'GET' && m) {
+          if (failEventsFor.has(m[1])) {
+            failEventsFor.delete(m[1]);
+            res.writeHead(503, { 'Content-Type': 'application/json' });
+            return res.end(
+              JSON.stringify({
+                error: 'service_unavailable',
+                message: 'reports temporarily unavailable',
+                retry_after: 22,
+              }),
+            );
+          }
           const batch = [...batches.values()].find((b) => b.id === m[1]);
           if (!batch) {
             res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -209,6 +222,59 @@ describe('dispatch and poll against a misbehaving provider', () => {
     const [acc] =
       await sql`select count(*)::int as n from public.send_recipients where send_id = ${sendId!} and status = 'accepted'`;
     expect(acc.n).toBe(row.approved_count);
+  });
+
+  it('a 503 on one batch ends the run with the rest deferred, and the next run takes those first', async () => {
+    const { dispatchSend } = await import('@/lib/send/dispatch');
+    const { pollSend } = await import('@/lib/send/poll');
+    const l = seedLogins().find((x) => x.brand === 'KILELE' && x.role === 'owner')!;
+    const kilele = createClient(rlsEnv.url, rlsEnv.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { error } = await kilele.auth.signInWithPassword({
+      email: l.email,
+      password: seedPasswords()[l.email],
+    });
+    if (error) throw error;
+    const { data: camp } = await kilele
+      .from('campaigns')
+      .select('id')
+      .eq('external_id', 'KIL-0005')
+      .single();
+    const { data: sendId } = await kilele.rpc('approve_send', { p_campaign_id: camp!.id });
+    created.push(sendId!);
+    const out = await dispatchSend(kilele as never, sendId!);
+    expect(out.kind).toBe('dispatched');
+    const rows = await sql<{ provider_batch_id: string; chunk_index: number }[]>`
+      select provider_batch_id, chunk_index from public.send_batches where send_id = ${sendId!} order by chunk_index`;
+    expect(rows.length).toBeGreaterThan(3);
+    failEventsFor.add(rows[2].provider_batch_id);
+
+    const first = await pollSend(sendId!);
+    expect(first.polled).toBe(2);
+    expect(first.failed).toBe(1);
+    expect(first.deferred).toBe(rows.length - 3);
+    expect(first.error).toMatch(/1 of \d+ batches did not answer: batch 3: .*503/);
+    const [send1] = await sql<{ last_error: string }[]>`
+      select last_error from public.sends where id = ${sendId!}`;
+    expect(send1.last_error).toMatch(/^poll: /);
+
+    // A run with no time left walks nothing and defers everything, honestly.
+    const none = await pollSend(sendId!, { deadlineMs: Date.now() - 1 });
+    expect(none.polled).toBe(0);
+    expect(none.deferred).toBe(rows.length);
+
+    const second = await pollSend(sendId!);
+    expect(second.error).toBeUndefined();
+    expect(second.failed).toBe(0);
+    // The two batches walked first time are polled last this time; everything gets walked.
+    expect(second.polled).toBe(rows.length);
+    const [send2] = await sql<{ last_error: string | null }[]>`
+      select last_error from public.sends where id = ${sendId!}`;
+    expect(send2.last_error).toBeNull();
+    const polled = await sql<{ n: number }[]>`
+      select count(*)::int as n from public.send_batches where send_id = ${sendId!} and last_polled_at is not null`;
+    expect(polled[0].n).toBe(rows.length);
   });
 
   it('a crash between chunks resumes from the next chunk and re-sends nothing', async () => {

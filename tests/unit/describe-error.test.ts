@@ -17,6 +17,15 @@ describe('describeSendError', () => {
       'An internal error was recorded. The engineer can read the detail in the send row.',
     );
   });
+  it('describes a partial poll as progress, not as a failed send', () => {
+    expect(
+      describeSendError(
+        'poll: 3 of 72 batches did not answer: batch 23: provider events failed: HTTP 503 {"error":"service_unavailable"}',
+      ),
+    ).toBe(
+      "3 of 72 provider batches did not answer (HTTP 503 from the provider's feedback endpoint). Nothing about the send changed; feedback is fetched again every minute, the batches waiting longest first.",
+    );
+  });
   it('is null for no error', () => {
     expect(describeSendError(null)).toBeNull();
   });

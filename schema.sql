@@ -203,7 +203,7 @@ begin
         'content-type', 'application/json',
         'x-poll-secret', (select decrypted_secret from vault.decrypted_secrets where name = 'poll_secret')),
       body := '{}'::jsonb,
-      timeout_milliseconds := 30000)
+      timeout_milliseconds := 58000)
   $cmd$;
 
   perform cron.unschedule(jobid) from cron.job where jobname = 'poll-provider-feedback';

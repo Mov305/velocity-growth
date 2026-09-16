@@ -5,7 +5,7 @@ import { z } from 'zod';
 import { getMembership } from '@/lib/auth/membership';
 import { createClient } from '@/lib/supabase/server';
 import { dispatchSend } from '@/lib/send/dispatch';
-import { pollSend } from '@/lib/send/poll';
+import { POLL_RUN_BUDGET_MS, pollSend } from '@/lib/send/poll';
 import { describeSendError } from '@/lib/send/describe-error';
 
 const Id = z.string().uuid();
@@ -67,9 +67,14 @@ export async function pollNow(_prev: ActionState, formData: FormData): Promise<A
   const supabase = await createClient();
   const visible = await supabase.from('sends').select('id').eq('id', parsed.data).maybeSingle();
   if (visible.error || !visible.data) return { error: 'That send is not in your brand.' };
-  const r = await pollSend(parsed.data);
-  if (r.error) return { error: describeSendError(`poll: ${r.error}`) ?? 'Polling failed.' };
+  const r = await pollSend(parsed.data, { deadlineMs: Date.now() + POLL_RUN_BUDGET_MS });
+  const progress = `${r.polled} of ${r.batches} batches walked${r.deferred ? `, ${r.deferred} deferred to the next run` : ''}`;
+  if (r.error) {
+    return {
+      error: `${describeSendError(`poll: ${r.error}`) ?? 'Polling failed.'} This run: ${progress}.`,
+    };
+  }
   return {
-    notice: `Polled ${r.pages} page${r.pages === 1 ? '' : 's'}: ${r.received} events received, ${r.inserted} new, ${r.duplicates} already stored, ${r.unknownRecipients} for recipients not in this send, ${r.malformed} malformed.`,
+    notice: `${progress}; ${r.pages} page${r.pages === 1 ? '' : 's'}: ${r.received} events received, ${r.inserted} new, ${r.duplicates} already stored, ${r.unknownRecipients} for recipients not in this send, ${r.malformed} malformed.`,
   };
 }
