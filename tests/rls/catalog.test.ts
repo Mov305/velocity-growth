@@ -113,7 +113,7 @@ describe('RLS catalog: the isolation guarantee cannot be removed without this fa
       join pg_namespace n on n.oid = p.pronamespace and n.nspname = r.routine_schema
       where r.routine_schema = 'public' and p.prosecdef
         and r.grantee in ('anon', 'authenticated', 'PUBLIC')
-        and r.routine_name in ('complete_dispatch', 'fail_dispatch', 'ingest_provider_events')`;
+        and r.routine_name in ('complete_dispatch', 'fail_dispatch', 'ingest_provider_events', 'open_share_link', 'share_results')`;
     expect(rows).toEqual([]);
   });
 

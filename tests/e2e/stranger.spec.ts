@@ -2,7 +2,7 @@ import { createClient } from '@supabase/supabase-js';
 import { expect, test } from '@playwright/test';
 import { config } from 'dotenv';
 
-config({ path: '.env.test', quiet: true });
+config({ path: process.env.ENV_FILE ?? '.env.test', quiet: true });
 
 /**
  * A stranger with the anon key, exactly what the graders will try first. The auth.users trigger

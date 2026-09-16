@@ -4,7 +4,11 @@ const W = 720;
 const H = 180;
 const PAD = { top: 12, right: 8, bottom: 26, left: 36 };
 
-const dayLabel = new Intl.DateTimeFormat('en-GB', { day: '2-digit', month: 'short', timeZone: 'UTC' });
+const dayLabel = new Intl.DateTimeFormat('en-GB', {
+  day: '2-digit',
+  month: 'short',
+  timeZone: 'UTC',
+});
 
 /**
  * One series, so one hue and no legend: the title names it. Thin bars from a true zero
@@ -20,8 +24,10 @@ export function SignupsChart({ days }: { days: SignupDay[] }) {
   if (total === 0) {
     return (
       <div className="rounded-sm border border-dashed border-rule px-6 py-10 text-center">
-        <p className="font-heading text-lg">No signups between {dayLabel.format(new Date(first))} and{' '}
-          {dayLabel.format(new Date(last))}</p>
+        <p className="font-heading text-lg">
+          No signups between {dayLabel.format(new Date(first))} and{' '}
+          {dayLabel.format(new Date(last))}
+        </p>
         <p className="mt-1 text-sm text-muted-foreground">
           Thirty days, all zero. The seed data for this brand ends earlier than this window.
         </p>

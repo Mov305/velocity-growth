@@ -1,7 +1,7 @@
 import { config } from 'dotenv';
 import { type Page, expect } from '@playwright/test';
 
-config({ path: '.env.test', quiet: true });
+config({ path: process.env.ENV_FILE ?? '.env.test', quiet: true });
 
 export type Login = { email: string; brand: string; role: 'owner' | 'analyst'; name: string };
 

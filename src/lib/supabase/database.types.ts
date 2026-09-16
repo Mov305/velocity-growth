@@ -16,6 +16,10 @@ export type Database = {
     }
     Functions: {
       is_owner_of: { Args: { p_brand_id: string }; Returns: boolean }
+      schedule_provider_poll: {
+        Args: { p_secret: string; p_url: string }
+        Returns: string
+      }
       user_brand_ids: { Args: never; Returns: string[] }
     }
     Enums: {
@@ -878,6 +882,16 @@ export type Database = {
           unknown_recipients: number
         }[]
       }
+      open_share_link: {
+        Args: { p_password: string; p_token: string }
+        Returns: {
+          brand_id: string
+          campaign_id: string
+          expires_at: string
+          link_id: string
+          outcome: string
+        }[]
+      }
       preview_send_audience: {
         Args: { p_campaign_id: string }
         Returns: {
@@ -885,6 +899,11 @@ export type Database = {
           audience_definition: string
         }[]
       }
+      publish_results: {
+        Args: { p_campaign_id: string; p_password: string }
+        Returns: string
+      }
+      revoke_share_link: { Args: { p_link_id: string }; Returns: undefined }
       send_outcomes: {
         Args: { p_send_id: string }
         Returns: {
@@ -898,6 +917,28 @@ export type Database = {
           queued: number
           rejected: number
           total: number
+          unsubscribed: number
+        }[]
+      }
+      share_results: {
+        Args: { p_link_id: string }
+        Returns: {
+          approved: number
+          bounced: number
+          brand_name: string
+          campaign_external_id: string
+          campaign_name: string
+          channel: string
+          clicked: number
+          complained: number
+          delivered: number
+          expires_at: string
+          last_dispatched_at: string
+          log_events: Json
+          opened: number
+          pending: number
+          rejected: number
+          sends: number
           unsubscribed: number
         }[]
       }

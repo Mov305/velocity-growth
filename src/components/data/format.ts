@@ -1,5 +1,8 @@
 const num = new Intl.NumberFormat('en-GB');
-const money = new Intl.NumberFormat('en-GB', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const money = new Intl.NumberFormat('en-GB', {
+  minimumFractionDigits: 2,
+  maximumFractionDigits: 2,
+});
 const date = new Intl.DateTimeFormat('en-GB', {
   year: 'numeric',
   month: 'short',
