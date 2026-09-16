@@ -21,6 +21,7 @@
     "db:schema": "supabase db dump --local --schema public,app -f schema.sql",
     "env:local": "tsx scripts/local-env.ts",
     "seed:users": "tsx scripts/seed-users.ts",
+    "poll:schedule": "tsx scripts/schedule-poll.ts",
     "seed:fetch": "tsx scripts/fetch-seed.ts",
     "import:seed": "tsx scripts/run-import.ts"
   },

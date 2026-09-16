@@ -173,6 +173,48 @@ $$;
 ALTER FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "app"."schedule_provider_poll"("p_url" "text", "p_secret" "text") RETURNS "text"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $_$
+declare
+  v_id uuid;
+  v_cmd text;
+begin
+  if p_url !~ '^https://' then
+    raise exception 'poll url must be https';
+  end if;
+  if length(p_secret) < 16 then
+    raise exception 'poll secret must be at least 16 characters';
+  end if;
+
+  select id into v_id from vault.secrets where name = 'poll_url';
+  if v_id is null then perform vault.create_secret(p_url, 'poll_url');
+  else perform vault.update_secret(v_id, p_url); end if;
+
+  select id into v_id from vault.secrets where name = 'poll_secret';
+  if v_id is null then perform vault.create_secret(p_secret, 'poll_secret');
+  else perform vault.update_secret(v_id, p_secret); end if;
+
+  v_cmd := $cmd$
+    select net.http_post(
+      url := (select decrypted_secret from vault.decrypted_secrets where name = 'poll_url'),
+      headers := jsonb_build_object(
+        'content-type', 'application/json',
+        'x-poll-secret', (select decrypted_secret from vault.decrypted_secrets where name = 'poll_secret')),
+      body := '{}'::jsonb,
+      timeout_milliseconds := 30000)
+  $cmd$;
+
+  perform cron.unschedule(jobid) from cron.job where jobname = 'poll-provider-feedback';
+  perform cron.schedule('poll-provider-feedback', '* * * * *', v_cmd);
+  return 'poll-provider-feedback scheduled every minute';
+end $_$;
+
+
+ALTER FUNCTION "app"."schedule_provider_poll"("p_url" "text", "p_secret" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "app"."set_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -1362,6 +1404,10 @@ GRANT ALL ON FUNCTION "app"."enforce_allowed_email"() TO "supabase_auth_admin";
 
 REVOKE ALL ON FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "app"."is_owner_of"("p_brand_id" "uuid") TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "app"."schedule_provider_poll"("p_url" "text", "p_secret" "text") FROM PUBLIC;
 
 
 

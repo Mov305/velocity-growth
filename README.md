@@ -218,9 +218,9 @@ Each stage is one commit, made only when asked.
 | 2     | Import pipeline: parsers, normalisers, rejects, run against the seed. Done locally.                                              |
 | 3     | Auth (email and Google), layout, contacts and campaigns views, imports view. Done.                                               |
 | 4     | Dashboard with definitions. Built.                                                                                               |
-| 5     | Send flow, dispatch and polling with pg_cron, live provider verification. Built.                                                 |
+| 5     | Send flow, dispatch and polling, live provider verification. Done (commit 7f612f7).                                              |
 | 6     | Shared results link                                                                                                              |
-| 7     | Mobile pass, states, `schema.sql`, deploy, submission note                                                                       |
+| 7     | Deploy to Vercel, Supabase URLs, pg_cron poll job, submission note. Hosting done: https://velocity-growth.vercel.app             |
 
 ## 7. Decisions log
 
@@ -263,6 +263,9 @@ Each stage is one commit, made only when asked.
 | 2026-09-16 | `/api/` is exempt from the session proxy; each route authenticates itself (`/api/poll` checks `x-poll-secret` with a constant-time compare)                                                                                     | The security review found the proxy answering the poll route with a 307 to the login page, so the scheduler could never have reached it. `tests/e2e/poll-route.spec.ts` asserts 403, not a redirect.                    |
 | 2026-09-16 | `approve_send` and `begin_dispatch` answer a foreign id and a non-existent id with the same code and text (42501, "not permitted")                                                                                              | A different message for "not found" would let a user learn whether another brand's ids exist. `tests/rls/sends.test.ts` asserts the two answers are identical.                                                          |
 | 2026-09-16 | Raw error text stays in `sends.last_error` and the server log; the screen shows a category from `describeSendError` (provider HTTP status, unreachable, audience mismatch, internal)                                            | PostgREST and driver messages name tables and functions. The marketer needs to know whether to retry, not the schema.                                                                                                   |
+| 2026-09-16 | Hosted on Vercel at https://velocity-growth.vercel.app through the Vercel CLI (project created, GitHub repo connected, env set with `vercel env add`); Vercel Authentication on deployments turned off                          | The connector could not see the personal scope; the CLI login could. Deployment protection would have sent the graders and pg_cron to a Vercel login page.                                                              |
+| 2026-09-16 | The poll job's URL and secret live in Supabase Vault and are set by `app.schedule_provider_poll`, called from `scripts/schedule-poll.ts`; the migration carries neither value                                                   | `cron.job` is readable by anyone with the postgres role and the migration is in git. Vault keeps the secret out of both.                                                                                                |
+| 2026-09-16 | The development CSP adds `'unsafe-eval'`; production does not                                                                                                                                                                   | React's development build rebuilds call stacks with eval and logged a console error on every page. Production never needs it.                                                                                           |
 
 ## 8. Running it
 
@@ -276,7 +279,15 @@ pnpm import:seed --all # load every file in scripts/import-manifest.ts, in order
 pnpm test              # unit
 pnpm test:rls          # isolation, auth gate and import suites against the local database
 pnpm db:schema         # regenerate schema.sql
+pnpm poll:schedule     # register the pg_cron job that polls provider feedback (ENV_FILE=.env.production for hosted)
 ```
+
+### Hosted
+
+- Portal: https://velocity-growth.vercel.app (Vercel project `velocity-growth`, deployed with `vercel deploy --prod` from this tree; the GitHub repo is connected so pushes to `main` deploy too).
+- Supabase project `ezfxccrbzswjilaghcdw` (eu-central-1). Site URL and the redirect allow-list carry the Vercel origin, so Google sign-in lands on `/auth/callback` there.
+- Environment on Vercel (production and preview): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`, `PROVIDER_BASE_URL`, `PROVIDER_API_KEY`, `POLL_SECRET`, `NEXT_PUBLIC_SITE_URL`. Set with `vercel env add` from the local env file; none of them are in the repo.
+- Polling: `app.schedule_provider_poll(url, secret)` stores both values in Supabase Vault and schedules the pg_cron job `poll-provider-feedback` (`* * * * *`), which runs `net.http_post` against `POST /api/poll` with the `x-poll-secret` header. Registered on the hosted project on 2026-09-16 with `ENV_FILE=.env.production pnpm poll:schedule`.
 
 One file at a time: `pnpm import:seed --brand KAROO --kind contacts --file data/seed/karoo-contacts.csv`. Every run writes an `imports` row and one `import_rejects` row per refused line, with the line number, the reason, and the raw values.
 
