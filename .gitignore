@@ -40,6 +40,6 @@ yarn-error.log*
 Thumbs.db
 
 # seed data: fetched by pnpm seed:fetch, never committed (42 MB)
-data/
+/data/
 
 .vercel
