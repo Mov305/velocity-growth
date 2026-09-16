@@ -322,4 +322,4 @@ Claude Code (Fable 5.1) with project-scoped agents for review, security review, 
 
 **The number I am least sure of.** Marrakech's dashboard "observed" opens and clicks. 633 of 940 Marrakech log rows were rejected because their contact or campaign id matches nothing in the seed, so the observed columns for that brand describe a third of the file. The brand's own reported figures sit beside them so the gap is visible.
 
-**Unfinished.** Marrakech's orphan events are rejected with a reason rather than parked (a decision); seed files over 4 MB load through the CLI, the upload screen takes smaller ones; the poll job walks every recent send in one run.
+**Unfinished.** Marrakech's orphan events are rejected rather than parked (a decision); seed files over 4 MB load through the CLI; the poll job walks every recent send in one budgeted run.
