@@ -142,7 +142,8 @@ describe('ingest_provider_events', () => {
       { contact_id: string }[]
     >`select contact_id from public.send_recipients where send_id = ${sendId!} limit 2`;
     const [r1, r2] = rec.map((r) => r.contact_id);
-    await sql`select public.complete_dispatch(${sendId!}, 'batch_test_ingest', ${[r1, r2]}::uuid[], ${[]}::uuid[])`;
+    await sql`select public.record_send_batch(${sendId!}, 0, 'key-test-ingest', 'batch_test_ingest', ${[r1, r2]}::uuid[], ${[]}::uuid[], '{}'::jsonb)`;
+    await sql`select public.complete_dispatch(${sendId!}, 1)`;
 
     const events = [
       { event_id: 'e-3', type: 'opened', recipient_id: r1, occurred_at: '2026-09-16T12:01:49Z' },

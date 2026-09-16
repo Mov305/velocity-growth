@@ -8,7 +8,9 @@ import { serverEnv } from '@/lib/env';
  *
  *   POST /v1/messages with Idempotency-Key: the key alone decides. Same key returns the same
  *   batch even with a different body; no key means a new batch every time. So the key is always
- *   the send's stored idempotency_key and the body is always the frozen audience.
+ *   derived from the send's stored idempotency_key and the body is always the frozen audience.
+ *   A batch takes at most 500 recipients; the rest come back rejected with reason
+ *   recipient_cap_exceeded as {reason, recipient: {id, email, phone}} (measured with 35,502).
  *   GET /v1/messages/{batch}/events: `since` is ignored whatever its value, `next_cursor` returns
  *   a different subset, events are duplicated, out of time order, appear minutes after dispatch,
  *   and one forged event names a recipient that is not ours. Nothing here is trusted: every
@@ -21,13 +23,38 @@ const Recipient = z.object({
   phone: z.string().nullable().optional(),
 });
 
+/** The most recipients one provider batch takes before it starts rejecting (measured). */
+export const PROVIDER_BATCH_CAP = 500;
+
 const DispatchResponse = z.object({
   batch_id: z.string().min(1),
   accepted: z.array(z.string()).default([]),
-  rejected: z.array(z.union([z.string(), z.object({ id: z.string() }).passthrough()])).default([]),
+  // Three shapes seen or documented: "id", {id}, {reason, recipient: {id}}. Anything else is
+  // kept as unknown and counted as a rejection with no id, never a crash.
+  rejected: z.array(z.unknown()).default([]),
   status: z.string().optional(),
 });
 export type DispatchResponse = z.infer<typeof DispatchResponse>;
+
+const RejectedString = z.string();
+const RejectedWithId = z.object({ id: z.string(), reason: z.string().optional() });
+const RejectedWithRecipient = z.object({
+  reason: z.string().optional(),
+  recipient: z.object({ id: z.string() }),
+});
+
+/** Rejected entries as {id, reason}; id is null when the provider gave no usable id. */
+export function rejectedEntries(r: DispatchResponse): Array<{ id: string | null; reason: string }> {
+  return r.rejected.map((item) => {
+    const s = RejectedString.safeParse(item);
+    if (s.success) return { id: s.data, reason: 'unspecified' };
+    const w = RejectedWithRecipient.safeParse(item);
+    if (w.success) return { id: w.data.recipient.id, reason: w.data.reason ?? 'unspecified' };
+    const i = RejectedWithId.safeParse(item);
+    if (i.success) return { id: i.data.id, reason: i.data.reason ?? 'unspecified' };
+    return { id: null, reason: 'unrecognised' };
+  });
+}
 
 const ProviderEvent = z
   .object({

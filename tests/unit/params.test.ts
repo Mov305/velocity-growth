@@ -29,8 +29,10 @@ describe('parseListParams', () => {
     expect(parseListParams({ page: ['2', '9'] }).page).toBe(2);
   });
 
-  it('strips characters PostgREST filters treat specially from the search text', () => {
-    // Commas, parentheses and dots are operators inside an or() filter string.
-    expect(parseListParams({ q: 'a,b(c).d*e' }).q).toBe('abcde');
+  it('keeps dots, commas and quotes in the search text and drops only control characters', () => {
+    // mary.nk must search for mary.nk; the query layer quotes the value for PostgREST.
+    expect(parseListParams({ q: 'mary.nk' }).q).toBe('mary.nk');
+    expect(parseListParams({ q: 'a,b(c)."d"' }).q).toBe('a,b(c)."d"');
+    expect(parseListParams({ q: 'a\u0000b\u001fc' }).q).toBe('abc');
   });
 });

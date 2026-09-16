@@ -35,6 +35,19 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
   const s = send.data;
   const campaign = Array.isArray(s.campaigns) ? s.campaigns[0] : s.campaigns;
 
+  const batches = await supabase
+    .from('send_batches')
+    .select(
+      'chunk_index, provider_batch_id, accepted_count, rejected_count, rejection_reasons, last_polled_at',
+      {
+        count: 'exact',
+      },
+    )
+    .eq('send_id', id)
+    .order('chunk_index', { ascending: true })
+    .range(0, 199);
+  if (batches.error) throw new Error(`send batches lookup failed: ${batches.error.message}`);
+
   const outcomes = await supabase.rpc('send_outcomes', { p_send_id: id });
   if (outcomes.error) throw new Error(`send outcomes failed: ${outcomes.error.message}`);
   const o = outcomes.data?.[0];
@@ -76,7 +89,9 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
           <p className="mt-1 font-mono text-3xl">{fmtNum(s.approved_count)}</p>
         </div>
         <div className="rounded-sm border border-rule bg-card p-4">
-          <p className="text-xs text-muted-foreground">Provider accepted</p>
+          <p className="text-xs text-muted-foreground">
+            Provider accepted<span className="fn">2</span>
+          </p>
           <p className="mt-1 font-mono text-3xl">{fmtNum(s.provider_accepted)}</p>
         </div>
         <div className="rounded-sm border border-rule bg-card p-4">
@@ -89,6 +104,12 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
         {s.audience_definition}. This number does not change afterwards, whatever happens to the
         contacts.
       </Footnote>
+      <Footnote n={2}>
+        The provider takes at most 500 recipients per batch, so a send is handed over in{' '}
+        {fmtNum(o.batches)} {o.batches === 1 ? 'batch' : 'batches'}, each under its own idempotency
+        key. Accepted is the sum over every batch; rejected recipients and the provider&rsquo;s
+        reason are listed per batch below.
+      </Footnote>
 
       <section className="rise rise-2 mt-6 rounded-sm border border-rule bg-card p-4">
         <p className="text-sm">{STATUS_TEXT[s.status] ?? s.status}</p>
@@ -98,7 +119,7 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
             <dd className="break-all">{s.idempotency_key}</dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">provider batch</dt>
+            <dt className="text-muted-foreground">first provider batch</dt>
             <dd className="break-all">{s.provider_batch_id ?? '–'}</dd>
           </div>
           <div>
@@ -132,11 +153,52 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
         </div>
       </section>
 
+      {batches.data.length > 0 ? (
+        <section className="rise rise-3 mt-6 rounded-sm border border-rule bg-card p-4">
+          <p className="text-sm">
+            Provider batches
+            {batches.count !== null && batches.count > batches.data.length
+              ? ` (showing the first ${fmtNum(batches.data.length)} of ${fmtNum(batches.count)})`
+              : ''}
+          </p>
+          <div className="mt-2 overflow-x-auto">
+            <table className="w-full text-xs">
+              <thead className="text-left text-muted-foreground">
+                <tr>
+                  <th className="py-1 pr-3 font-normal">#</th>
+                  <th className="py-1 pr-3 font-normal">batch</th>
+                  <th className="py-1 pr-3 text-right font-normal">accepted</th>
+                  <th className="py-1 pr-3 text-right font-normal">rejected</th>
+                  <th className="py-1 pr-3 font-normal">reasons</th>
+                  <th className="py-1 font-normal">last polled</th>
+                </tr>
+              </thead>
+              <tbody>
+                {batches.data.map((b) => (
+                  <tr key={b.chunk_index} className="border-t border-rule">
+                    <td className="py-1 pr-3 font-mono">{b.chunk_index + 1}</td>
+                    <td className="py-1 pr-3 font-mono break-all">{b.provider_batch_id}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{fmtNum(b.accepted_count)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{fmtNum(b.rejected_count)}</td>
+                    <td className="py-1 pr-3">
+                      {Object.entries((b.rejection_reasons ?? {}) as Record<string, number>)
+                        .map(([k, v]) => `${k} ${fmtNum(v)}`)
+                        .join(', ') || '–'}
+                    </td>
+                    <td className="py-1">{fmtDateTime(b.last_polled_at)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </section>
+      ) : null}
+
       <section className="rise rise-3 mt-6">
         <h3 className="text-xl">
-          Where each recipient stands<span className="fn">2</span>
+          Where each recipient stands<span className="fn">3</span>
         </h3>
-        <Footnote n={2}>
+        <Footnote n={3}>
           One row per recipient in the frozen audience, at its latest state. States only move
           forward; a bounce, complaint or unsubscribe is final even if a later delivery report
           arrives. Rows add up to the approved audience.

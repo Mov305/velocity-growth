@@ -27,6 +27,9 @@ const serverSchema = publicSchema.extend({
   PROVIDER_API_KEY: z.string().min(1),
   // Shared secret the scheduler sends to the poll route. Absent means polling is manual only.
   POLL_SECRET: z.string().min(16).optional(),
+  // Signs the unlock cookie for shared results links. Its own secret, so rotating it signs
+  // every viewer out without touching any other credential.
+  SHARE_COOKIE_SECRET: z.string().min(32),
 });
 
 export type PublicEnv = z.infer<typeof publicSchema>;

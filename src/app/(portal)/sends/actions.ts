@@ -53,7 +53,7 @@ export async function confirmSend(_prev: ActionState, formData: FormData): Promi
       notice: `This send is already ${outcome.status}${outcome.batchId ? ` (provider batch ${outcome.batchId})` : ''}. It was not sent again.`,
     };
   return {
-    notice: `Sent. The provider accepted ${outcome.accepted.toLocaleString('en-GB')} and rejected ${outcome.rejected.toLocaleString('en-GB')}; batch ${outcome.batchId}.`,
+    notice: `Sent in ${outcome.batches.toLocaleString('en-GB')} provider ${outcome.batches === 1 ? 'batch' : 'batches'}. The provider accepted ${outcome.accepted.toLocaleString('en-GB')} and rejected ${outcome.rejected.toLocaleString('en-GB')}; first batch ${outcome.batchId}.`,
   };
 }
 

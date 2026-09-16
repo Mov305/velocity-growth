@@ -30,8 +30,9 @@ const Schema = z.object({
     .transform((v) =>
       (v ?? '')
         .trim()
-        // These are operators inside a PostgREST or() filter; they never belong in a name search.
-        .replace(/[,().*"\\]/g, '')
+        // Control characters never belong in a search. Everything else, including dots, commas
+        // and quotes, is kept: the query layer quotes the value for PostgREST (see orValue).
+        .replace(/[\u0000-\u001f\u007f]/g, '')
         .slice(0, 100),
     ),
   status: z

@@ -1,7 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '@/lib/supabase/database.types';
 import { rangeFor, type ListParams } from '@/lib/params';
-import { escapeLike, toPage, type Page } from './page';
+import { escapeLike, orValue, toPage, type Page } from './page';
 
 export type { Page } from './page';
 
@@ -32,7 +32,7 @@ function withFilters<Q extends { eq: (c: string, v: string) => Q; or: (f: string
   let q = query;
   if (params.status) q = q.eq('status', params.status);
   if (params.q) {
-    const term = `%${escapeLike(params.q)}%`;
+    const term = orValue(`%${escapeLike(params.q)}%`);
     q = q.or(`full_name.ilike.${term},email.ilike.${term},external_id.ilike.${term}`);
   }
   return q;

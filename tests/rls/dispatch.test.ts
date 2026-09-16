@@ -13,6 +13,9 @@ import { rlsEnv, seedLogins, seedPasswords } from './setup';
 type Recorded = { idem: string | null; recipients: string[] };
 const calls: Recorded[] = [];
 let failNext = false;
+/** Fail the nth POST from now (1-based) once; simulates a crash between chunks. */
+let failAtCall: number | null = null;
+const CAP = 500;
 let server: Server;
 let baseUrl = '';
 const batches = new Map<string, { id: string; recipients: string[] }>();
@@ -25,27 +28,37 @@ function startMock(): Promise<void> {
       req.on('end', () => {
         const url = new URL(req.url!, 'http://x');
         if (req.method === 'POST' && url.pathname === '/v1/messages') {
-          if (failNext) {
+          if (failNext || (failAtCall !== null && --failAtCall === 0)) {
             failNext = false;
+            failAtCall = null;
             res.writeHead(503, { 'Content-Type': 'application/json' });
             return res.end(JSON.stringify({ error: 'unavailable' }));
           }
           const idem = req.headers['idempotency-key'] as string | undefined;
-          const recipients = (JSON.parse(body).recipients as Array<{ id: string }>).map(
-            (r) => r.id,
-          );
-          calls.push({ idem: idem ?? null, recipients });
+          const all = JSON.parse(body).recipients as Array<{
+            id: string;
+            email: string | null;
+            phone: string | null;
+          }>;
+          calls.push({ idem: idem ?? null, recipients: all.map((r) => r.id) });
           let batch = idem ? batches.get(idem) : undefined;
           if (!batch) {
-            batch = { id: `batch_${Math.random().toString(16).slice(2, 10)}`, recipients };
+            // The measured cap: 500 accepted, the rest rejected with the measured shape.
+            batch = {
+              id: `batch_${Math.random().toString(16).slice(2, 10)}`,
+              recipients: all.slice(0, CAP).map((r) => r.id),
+            };
             if (idem) batches.set(idem, batch);
           }
+          const over = all.slice(CAP);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           return res.end(
             JSON.stringify({
               batch_id: batch.id,
               accepted: batch.recipients,
-              rejected: [],
+              accepted_count: batch.recipients.length,
+              rejected: over.map((r) => ({ reason: 'recipient_cap_exceeded', recipient: r })),
+              rejected_count: over.length,
               status: 'accepted',
             }),
           );
@@ -178,11 +191,74 @@ describe('dispatch and poll against a misbehaving provider', () => {
     const before = calls.length;
     const out = await dispatchSend(kilele as never, sendId!);
     expect(out.kind).toBe('dispatched');
-    expect(calls.length - before).toBe(1);
-    expect(calls[calls.length - 1].recipients).toHaveLength(row.approved_count);
+    const expectedBatches = Math.ceil(row.approved_count / CAP);
+    expect(calls.length - before).toBe(expectedBatches);
+    const mine = calls.slice(before);
+    expect(mine.every((c) => c.recipients.length <= CAP)).toBe(true);
+    expect(mine.reduce((n, c) => n + c.recipients.length, 0)).toBe(row.approved_count);
+    const [send] =
+      await sql`select idempotency_key, provider_accepted, provider_rejected from public.sends where id = ${sendId!}`;
+    expect(mine[0].idem).toBe(send.idempotency_key);
+    expect(mine[1].idem).toBe(`${send.idempotency_key}:1`);
+    expect(new Set(mine.map((c) => c.idem)).size).toBe(expectedBatches);
+    expect(send.provider_accepted).toBe(row.approved_count);
+    expect(send.provider_rejected).toBe(0);
+    const [b] =
+      await sql`select count(*)::int as n from public.send_batches where send_id = ${sendId!}`;
+    expect(b.n).toBe(expectedBatches);
     const [acc] =
       await sql`select count(*)::int as n from public.send_recipients where send_id = ${sendId!} and status = 'accepted'`;
     expect(acc.n).toBe(row.approved_count);
+  });
+
+  it('a crash between chunks resumes from the next chunk and re-sends nothing', async () => {
+    const { dispatchSend } = await import('@/lib/send/dispatch');
+    const l = seedLogins().find((x) => x.brand === 'KILELE' && x.role === 'owner')!;
+    const kilele = createClient(rlsEnv.url, rlsEnv.anonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { error } = await kilele.auth.signInWithPassword({
+      email: l.email,
+      password: seedPasswords()[l.email],
+    });
+    if (error) throw error;
+    const { data: camp } = await kilele
+      .from('campaigns')
+      .select('id')
+      .eq('external_id', 'KIL-0004')
+      .single();
+    const { data: sendId } = await kilele.rpc('approve_send', { p_campaign_id: camp!.id });
+    created.push(sendId!);
+    const [row] = await sql`select approved_count from public.sends where id = ${sendId!}`;
+    const expectedBatches = Math.ceil(row.approved_count / CAP);
+    expect(expectedBatches).toBeGreaterThan(2);
+
+    failAtCall = 3; // chunks 0 and 1 succeed, chunk 2 hits the outage
+    const before = calls.length;
+    const first = await dispatchSend(kilele as never, sendId!);
+    expect(first.kind).toBe('failed');
+    expect(calls.length - before).toBe(2);
+    const [mid] =
+      await sql`select status, provider_batch_id from public.sends where id = ${sendId!}`;
+    expect(mid.status).toBe('failed');
+    expect(mid.provider_batch_id).toBeNull();
+    const [recorded] =
+      await sql`select count(*)::int as n from public.send_batches where send_id = ${sendId!}`;
+    expect(recorded.n).toBe(2);
+
+    const retryFrom = calls.length;
+    const second = await dispatchSend(kilele as never, sendId!);
+    expect(second.kind).toBe('dispatched');
+    // Only the chunks that were not recorded are posted again, under their own keys.
+    expect(calls.length - retryFrom).toBe(expectedBatches - 2);
+    const [send] =
+      await sql`select status, idempotency_key, provider_accepted from public.sends where id = ${sendId!}`;
+    expect(send.status).toBe('dispatched');
+    expect(calls[retryFrom].idem).toBe(`${send.idempotency_key}:2`);
+    expect(send.provider_accepted).toBe(row.approved_count);
+    const [all] =
+      await sql`select count(*)::int as n from public.send_batches where send_id = ${sendId!}`;
+    expect(all.n).toBe(expectedBatches);
   });
 
   it('two concurrent confirms make exactly one provider call, with the stored idempotency key', async () => {
@@ -200,6 +276,7 @@ describe('dispatch and poll against a misbehaving provider', () => {
     const [row] =
       await sql`select status, provider_batch_id, idempotency_key, approved_count, provider_accepted from public.sends where id = ${sendId!}`;
     expect(row.status).toBe('dispatched');
+    expect(row.approved_count).toBeLessThanOrEqual(CAP);
     expect(calls[calls.length - 1].idem).toBe(row.idempotency_key);
     expect(calls[calls.length - 1].recipients).toHaveLength(row.approved_count);
     expect(row.provider_accepted).toBe(row.approved_count);

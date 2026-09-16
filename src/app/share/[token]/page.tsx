@@ -26,7 +26,7 @@ export default async function SharePage({ params }: PageProps<'/share/[token]'>)
   const env = serverEnv();
   const store = await cookies();
   const linkId = readShareCookie(
-    env.SUPABASE_SERVICE_ROLE_KEY,
+    env.SHARE_COOKIE_SECRET,
     token,
     store.get(shareCookieName(token))?.value,
     serverNowMs(),
@@ -42,7 +42,8 @@ export default async function SharePage({ params }: PageProps<'/share/[token]'>)
           <h1 className="mt-2 text-4xl">Shared results</h1>
           <p className="mt-3 text-sm text-muted-foreground">
             This page was shared with a password. Enter it to see the campaign&rsquo;s results. Ten
-            wrong tries lock the link for fifteen minutes.
+            wrong tries lock the link, and thirty tries from one connection pause it, for fifteen
+            minutes.
           </p>
         </div>
         <div className="rise rise-2 mt-10 border-t border-rule pt-8">

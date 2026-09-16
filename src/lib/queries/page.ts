@@ -8,6 +8,14 @@ export function escapeLike(term: string): string {
   return term.replace(/[\\%_]/g, (c) => `\\${c}`);
 }
 
+/**
+ * A value inside a PostgREST or() filter, quoted so commas, parens, dots and spaces in what the
+ * marketer typed stay literal. Only the quote and the backslash are escaped inside the quotes.
+ */
+export function orValue(value: string): string {
+  return `"${value.replace(/["\\]/g, (c) => `\\${c}`)}"`;
+}
+
 /** PostgREST answers 416 with this code when the requested range starts past the last row. */
 const RANGE_NOT_SATISFIABLE = 'PGRST103';
 

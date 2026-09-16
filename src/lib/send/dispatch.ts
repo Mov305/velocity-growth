@@ -1,22 +1,38 @@
 import 'server-only';
 
 import type { SupabaseClient } from '@supabase/supabase-js';
-import type { Database } from '@/lib/supabase/database.types';
+import type { Database, Json } from '@/lib/supabase/database.types';
 import { createAdminClient } from '@/lib/supabase/admin';
-import { dispatchBatch } from '@/lib/provider/client';
+import { PROVIDER_BATCH_CAP, dispatchBatch, rejectedEntries } from '@/lib/provider/client';
 
 export type DispatchOutcome =
-  | { kind: 'dispatched'; sendId: string; batchId: string; accepted: number; rejected: number }
+  | {
+      kind: 'dispatched';
+      sendId: string;
+      batchId: string;
+      batches: number;
+      accepted: number;
+      rejected: number;
+    }
   | { kind: 'already'; sendId: string; status: string; batchId: string | null }
   | { kind: 'failed'; sendId: string; error: string };
+
+/** Idempotency key for one chunk of a send: the send's own key for the first, key:n after. */
+export function chunkKey(sendKey: string, chunkIndex: number): string {
+  return chunkIndex === 0 ? sendKey : `${sendKey}:${chunkIndex}`;
+}
 
 /**
  * Confirms a send. The caller's own client runs begin_dispatch, so the owner check and the
  * one-winner transition happen in SQL under the caller's identity. Only after winning that row is
  * the service role used, and only to record what the provider said.
  *
- * Retry safety: the Idempotency-Key is the send's stored key, so a second call after a crash gets
- * the same batch from the provider instead of a second send (measured, README section 3).
+ * The provider takes at most PROVIDER_BATCH_CAP recipients per batch (measured, README section
+ * 3), so the frozen audience goes in chunks, each under its own idempotency key and each recorded
+ * in send_batches the moment the provider answers. A thrown error between chunks marks the send
+ * `failed` with the recorded chunks in place; a process death leaves it `dispatching` until the
+ * five-minute takeover in begin_dispatch. Either way the retry skips recorded chunks and re-posts
+ * the rest under the same keys, so the provider returns the same batches and nothing is sent twice.
  */
 export async function dispatchSend(
   userClient: SupabaseClient<Database>,
@@ -67,36 +83,77 @@ export async function dispatchSend(
     );
   }
 
-  const [brand, campaign] = await Promise.all([
+  const [brand, campaign, recorded] = await Promise.all([
     admin.from('brands').select('code').eq('id', send.brand_id).single(),
     admin.from('campaigns').select('external_id').eq('id', send.campaign_id).single(),
+    admin
+      .from('send_batches')
+      .select('chunk_index', { count: 'exact' })
+      .eq('send_id', sendId)
+      .range(0, 999),
   ]);
+  if (recorded.error) return fail(`recorded batches read failed: ${recorded.error.message}`);
+  if ((recorded.count ?? 0) > recorded.data.length) {
+    return fail(`${recorded.count} batches recorded but only ${recorded.data.length} readable`);
+  }
+  const already = new Set(recorded.data.map((b) => b.chunk_index));
+
+  const chunks: AudienceRow[][] = [];
+  for (let i = 0; i < recipients.rows.length; i += PROVIDER_BATCH_CAP) {
+    chunks.push(recipients.rows.slice(i, i + PROVIDER_BATCH_CAP));
+  }
 
   try {
-    const result = await dispatchBatch({
-      idempotencyKey: send.idempotency_key,
-      campaign: campaign.data?.external_id ?? send.campaign_id,
-      brand: brand.data?.code ?? send.brand_id,
-      recipients: recipients.rows,
-    });
-    const ours = new Set(recipients.rows.map((r) => r.id));
-    const accepted = result.accepted.filter((id) => ours.has(id));
-    const rejected = result.rejected
-      .map((r) => (typeof r === 'string' ? r : r.id))
-      .filter((id) => ours.has(id));
+    for (let i = 0; i < chunks.length; i++) {
+      if (already.has(i)) continue;
+      const chunk = chunks[i];
+      const key = chunkKey(send.idempotency_key, i);
+      const result = await dispatchBatch({
+        idempotencyKey: key,
+        campaign: campaign.data?.external_id ?? send.campaign_id,
+        brand: brand.data?.code ?? send.brand_id,
+        recipients: chunk,
+      });
+      // Only this chunk's recipients count; anything else in the answer is the provider's noise.
+      const ours = new Set(chunk.map((r) => r.id));
+      const accepted = result.accepted.filter((id) => ours.has(id));
+      const reasons: Record<string, number> = {};
+      const rejected: string[] = [];
+      for (const r of rejectedEntries(result)) {
+        if (!r.id || !ours.has(r.id)) continue;
+        rejected.push(r.id);
+        reasons[r.reason] = (reasons[r.reason] ?? 0) + 1;
+      }
+      const rec = await admin.rpc('record_send_batch', {
+        p_send_id: sendId,
+        p_chunk_index: i,
+        p_idempotency_key: key,
+        p_batch_id: result.batch_id,
+        p_accepted: accepted,
+        p_rejected: rejected,
+        p_reasons: reasons as Json,
+      });
+      if (rec.error) throw new Error(`record_send_batch failed: ${rec.error.message}`);
+    }
+
     const done = await admin.rpc('complete_dispatch', {
       p_send_id: sendId,
-      p_batch_id: result.batch_id,
-      p_accepted: accepted,
-      p_rejected: rejected,
+      p_expected_batches: chunks.length,
     });
     if (done.error) throw new Error(`complete_dispatch failed: ${done.error.message}`);
+    const totals = await admin
+      .from('sends')
+      .select('provider_batch_id, provider_accepted, provider_rejected')
+      .eq('id', sendId)
+      .single();
+    if (totals.error) throw new Error(`send lookup failed: ${totals.error.message}`);
     return {
       kind: 'dispatched',
       sendId,
-      batchId: result.batch_id,
-      accepted: accepted.length,
-      rejected: rejected.length,
+      batchId: totals.data.provider_batch_id ?? '',
+      batches: chunks.length,
+      accepted: totals.data.provider_accepted ?? 0,
+      rejected: totals.data.provider_rejected ?? 0,
     };
   } catch (e) {
     return fail(e instanceof Error ? e.message : String(e));

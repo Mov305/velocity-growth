@@ -515,6 +515,66 @@ export type Database = {
           },
         ]
       }
+      send_batches: {
+        Row: {
+          accepted_count: number
+          brand_id: string
+          chunk_index: number
+          created_at: string
+          id: string
+          idempotency_key: string
+          last_polled_at: string | null
+          poll_cursor: string | null
+          provider_batch_id: string
+          rejected_count: number
+          rejection_reasons: Json
+          send_id: string
+        }
+        Insert: {
+          accepted_count?: number
+          brand_id: string
+          chunk_index: number
+          created_at?: string
+          id?: string
+          idempotency_key: string
+          last_polled_at?: string | null
+          poll_cursor?: string | null
+          provider_batch_id: string
+          rejected_count?: number
+          rejection_reasons?: Json
+          send_id: string
+        }
+        Update: {
+          accepted_count?: number
+          brand_id?: string
+          chunk_index?: number
+          created_at?: string
+          id?: string
+          idempotency_key?: string
+          last_polled_at?: string | null
+          poll_cursor?: string | null
+          provider_batch_id?: string
+          rejected_count?: number
+          rejection_reasons?: Json
+          send_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "send_batches_brand_id_fkey"
+            columns: ["brand_id"]
+            isOneToOne: false
+            referencedRelation: "brands"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "send_batches_send_id_fkey"
+            columns: ["send_id"]
+            isOneToOne: false
+            referencedRelation: "sends"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       send_log_entries: {
         Row: {
           attempt_no: number
@@ -763,6 +823,24 @@ export type Database = {
           },
         ]
       }
+      share_unlock_attempts: {
+        Row: {
+          attempts: number
+          client_key: string
+          window_start: string
+        }
+        Insert: {
+          attempts?: number
+          client_key: string
+          window_start: string
+        }
+        Update: {
+          attempts?: number
+          client_key?: string
+          window_start?: string
+        }
+        Relationships: []
+      }
     }
     Views: {
       import_reject_summary: {
@@ -847,12 +925,7 @@ export type Database = {
         }[]
       }
       complete_dispatch: {
-        Args: {
-          p_accepted: string[]
-          p_batch_id: string
-          p_rejected: string[]
-          p_send_id: string
-        }
+        Args: { p_expected_batches: number; p_send_id: string }
         Returns: undefined
       }
       contact_is_contactable: {
@@ -883,7 +956,7 @@ export type Database = {
         }[]
       }
       open_share_link: {
-        Args: { p_password: string; p_token: string }
+        Args: { p_client_key?: string; p_password: string; p_token: string }
         Returns: {
           brand_id: string
           campaign_id: string
@@ -903,11 +976,24 @@ export type Database = {
         Args: { p_campaign_id: string; p_password: string }
         Returns: string
       }
+      record_send_batch: {
+        Args: {
+          p_accepted: string[]
+          p_batch_id: string
+          p_chunk_index: number
+          p_idempotency_key: string
+          p_reasons: Json
+          p_rejected: string[]
+          p_send_id: string
+        }
+        Returns: undefined
+      }
       revoke_share_link: { Args: { p_link_id: string }; Returns: undefined }
       send_outcomes: {
         Args: { p_send_id: string }
         Returns: {
           accepted: number
+          batches: number
           bounced: number
           clicked: number
           complained: number

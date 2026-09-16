@@ -6,7 +6,7 @@ import { fetchEvents } from '@/lib/provider/client';
 
 export type PollResult = {
   sendId: string;
-  batchId: string;
+  batches: number;
   pages: number;
   received: number;
   inserted: number;
@@ -19,28 +19,38 @@ export type PollResult = {
 const MAX_PAGES = 20;
 
 /**
- * Pulls everything the provider has for one batch and hands it to ingest_provider_events, which
- * deduplicates on event id and applies status transitions monotonically. Because `since` is
- * ignored by the provider (measured), every poll starts from the beginning and follows the cursor
- * while has_more; the database makes that idempotent.
+ * Pulls everything the provider has for every batch of one send and hands it to
+ * ingest_provider_events, which deduplicates on event id and applies status transitions
+ * monotonically. Because `since` is ignored by the provider (measured), every poll starts from the
+ * beginning of each batch and follows the cursor while has_more; the database makes that
+ * idempotent.
  */
 export async function pollSend(sendId: string): Promise<PollResult> {
   // Service role: the scheduler has no user. The send id fixes the brand; nothing is filtered
   // by anything a caller supplies.
   const admin = createAdminClient();
-  const send = await admin
-    .from('sends')
-    .select('id, provider_batch_id, status')
-    .eq('id', sendId)
-    .single();
+  const send = await admin.from('sends').select('id, status').eq('id', sendId).single();
   if (send.error) throw new Error(`send lookup failed: ${send.error.message}`);
-  if (!send.data.provider_batch_id || send.data.status !== 'dispatched') {
-    throw new Error(`send ${sendId} is ${send.data.status} with no batch; nothing to poll`);
+  if (send.data.status !== 'dispatched') {
+    throw new Error(`send ${sendId} is ${send.data.status}; nothing to poll`);
   }
-  const batchId = send.data.provider_batch_id;
+  const batches = await admin
+    .from('send_batches')
+    .select('id, provider_batch_id, chunk_index', { count: 'exact' })
+    .eq('send_id', sendId)
+    .order('chunk_index', { ascending: true })
+    .range(0, 999);
+  if (batches.error) throw new Error(`batches lookup failed: ${batches.error.message}`);
+  if ((batches.count ?? 0) > batches.data.length) {
+    throw new Error(
+      `send ${sendId} has ${batches.count} batches but only ${batches.data.length} can be polled in one run`,
+    );
+  }
+  if (batches.data.length === 0) throw new Error(`send ${sendId} has no recorded batch`);
+
   const result: PollResult = {
     sendId,
-    batchId,
+    batches: batches.data.length,
     pages: 0,
     received: 0,
     inserted: 0,
@@ -49,33 +59,37 @@ export async function pollSend(sendId: string): Promise<PollResult> {
     malformed: 0,
   };
 
-  let cursor: string | null = null;
-  const seenCursors = new Set<string>();
   try {
-    for (let page = 0; page < MAX_PAGES; page++) {
-      const res = await fetchEvents(batchId, cursor);
-      result.pages++;
-      result.received += res.events.length;
-      result.malformed += res.malformed;
-      if (res.events.length > 0) {
-        const ingested = await admin.rpc('ingest_provider_events', {
-          p_send_id: sendId,
-          p_events: res.events as unknown as Json,
-        });
-        if (ingested.error) throw new Error(`ingest failed: ${ingested.error.message}`);
-        const row = ingested.data?.[0];
-        result.inserted += row?.inserted ?? 0;
-        result.duplicates += row?.duplicates ?? 0;
-        result.unknownRecipients += row?.unknown_recipients ?? 0;
+    for (const batch of batches.data) {
+      let cursor: string | null = null;
+      const seenCursors = new Set<string>();
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const res = await fetchEvents(batch.provider_batch_id, cursor);
+        result.pages++;
+        result.received += res.events.length;
+        result.malformed += res.malformed;
+        if (res.events.length > 0) {
+          const ingested = await admin.rpc('ingest_provider_events', {
+            p_send_id: sendId,
+            p_events: res.events as unknown as Json,
+          });
+          if (ingested.error) throw new Error(`ingest failed: ${ingested.error.message}`);
+          const row = ingested.data?.[0];
+          result.inserted += row?.inserted ?? 0;
+          result.duplicates += row?.duplicates ?? 0;
+          result.unknownRecipients += row?.unknown_recipients ?? 0;
+        }
+        if (!res.hasMore || !res.nextCursor || seenCursors.has(res.nextCursor)) break;
+        seenCursors.add(res.nextCursor);
+        cursor = res.nextCursor;
       }
-      if (!res.hasMore || !res.nextCursor || seenCursors.has(res.nextCursor)) break;
-      seenCursors.add(res.nextCursor);
-      cursor = res.nextCursor;
+      const mark = await admin
+        .from('send_batches')
+        .update({ poll_cursor: cursor, last_polled_at: new Date().toISOString() })
+        .eq('id', batch.id);
+      if (mark.error) throw new Error(`batch poll could not be recorded: ${mark.error.message}`);
     }
-    const done = await admin
-      .from('sends')
-      .update({ poll_cursor: cursor, last_error: null })
-      .eq('id', sendId);
+    const done = await admin.from('sends').update({ last_error: null }).eq('id', sendId);
     if (done.error) result.error = `poll succeeded but could not record it: ${done.error.message}`;
   } catch (e) {
     result.error = e instanceof Error ? e.message : String(e);

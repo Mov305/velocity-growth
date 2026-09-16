@@ -43,6 +43,20 @@ test('contacts search narrows by id and the count follows', async ({ page }) => 
   for (const id of ids) expect(id).toContain('CT-0057');
 });
 
+test('a dotted email fragment searches for exactly that text', async ({ page }) => {
+  await signIn(page, loginFor('KAROO', 'owner'));
+  await page.goto('/contacts');
+  // Take a real email from the first page and search for its dotted local part.
+  const emails = await page.locator('tbody tr').first().locator('td').allInnerTexts();
+  const email = emails.find((t) => t.includes('@'))!;
+  const local = email.split('@')[0];
+  expect(local).toContain('.');
+  await page.goto(`/contacts?q=${encodeURIComponent(local)}`);
+  const cells = await page.locator('tbody tr td').allInnerTexts();
+  expect(cells.some((t) => t.includes(email))).toBe(true);
+  await expect(page.getByRole('heading', { level: 2 })).not.toContainText('0 contacts');
+});
+
 test('ILIKE wildcards in the search box are literal characters, not patterns', async ({ page }) => {
   await signIn(page, loginFor('KAROO', 'analyst'));
   await page.goto('/contacts?q=_');

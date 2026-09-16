@@ -1,7 +1,7 @@
 import type { SupabaseClient } from '@supabase/supabase-js';
 import type { Database } from '@/lib/supabase/database.types';
 import { rangeFor, type ListParams } from '@/lib/params';
-import { escapeLike, toPage, type Page } from './page';
+import { escapeLike, orValue, toPage, type Page } from './page';
 
 export type CampaignRow = Pick<
   Database['public']['Tables']['campaigns']['Row'],
@@ -26,7 +26,7 @@ const COLUMNS =
 
 function withFilters<Q extends { or: (f: string) => Q }>(query: Q, params: ListParams): Q {
   if (!params.q) return query;
-  const term = `%${escapeLike(params.q)}%`;
+  const term = orValue(`%${escapeLike(params.q)}%`);
   return query.or(`name.ilike.${term},external_id.ilike.${term}`);
 }
 

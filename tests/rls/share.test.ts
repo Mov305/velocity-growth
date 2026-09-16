@@ -195,6 +195,33 @@ describe('opening', () => {
     expect(row.failed_attempts).toBe(10);
   });
 
+  it('the 31st unlock call from one connection in a window is throttled; another connection is not', async () => {
+    const { token } = await publish();
+    const key = `test-client-${Date.now()}`;
+    const outcomes: string[] = [];
+    for (let i = 0; i < 31; i++) {
+      const r = await admin.rpc('open_share_link', {
+        p_token: token,
+        p_password: 'correct horse battery',
+        p_client_key: key,
+      });
+      expect(r.error).toBeNull();
+      outcomes.push(r.data?.[0]?.outcome ?? 'none');
+    }
+    expect(outcomes.slice(0, 30).every((o) => o === 'ok')).toBe(true);
+    expect(outcomes[30]).toBe('throttled');
+    const other = await admin.rpc('open_share_link', {
+      p_token: token,
+      p_password: 'correct horse battery',
+      p_client_key: `${key}-other`,
+    });
+    expect(other.data?.[0]?.outcome).toBe('ok');
+    const [row] = await sql<{ attempts: number }[]>`
+      select attempts from public.share_unlock_attempts where client_key = ${key}`;
+    expect(row.attempts).toBe(31);
+    await sql`delete from public.share_unlock_attempts where client_key like ${key + '%'}`;
+  });
+
   it('a revoked link is unavailable to open and to render, and only an owner can revoke', async () => {
     const { token, id } = await publish();
     const byAnalyst = await analyst.rpc('revoke_share_link', { p_link_id: id });

@@ -393,24 +393,33 @@ $$;
 ALTER FUNCTION "public"."campaign_performance"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_expected_batches" integer) RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
+declare
+  v_first text;
+  v_accepted integer;
+  v_rejected integer;
+  v_batches integer;
 begin
-  update public.send_recipients set status = 'accepted'
-  where send_id = p_send_id and contact_id = any(p_accepted) and status = 'queued';
-  update public.send_recipients set status = 'rejected'
-  where send_id = p_send_id and contact_id = any(p_rejected) and status = 'queued';
+  select count(*)::int, coalesce(sum(accepted_count), 0)::int, coalesce(sum(rejected_count), 0)::int
+  into v_batches, v_accepted, v_rejected
+  from public.send_batches where send_id = p_send_id;
+  if v_batches = 0 or v_batches <> p_expected_batches then
+    raise exception 'expected % batches recorded for send, found %', p_expected_batches, v_batches
+      using errcode = 'P0002';
+  end if;
+  select provider_batch_id into v_first from public.send_batches
+  where send_id = p_send_id order by chunk_index limit 1;
   update public.sends
-  set status = 'dispatched', dispatched_at = now(), provider_batch_id = p_batch_id,
-      provider_accepted = coalesce(array_length(p_accepted, 1), 0),
-      provider_rejected = coalesce(array_length(p_rejected, 1), 0)
+  set status = 'dispatched', dispatched_at = now(), provider_batch_id = v_first,
+      provider_accepted = v_accepted, provider_rejected = v_rejected, last_error = null
   where id = p_send_id and status = 'dispatching';
 end $$;
 
 
-ALTER FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) OWNER TO "postgres";
+ALTER FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_expected_batches" integer) OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."contacts" (
@@ -636,14 +645,28 @@ end $$;
 ALTER FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_events" "jsonb") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text") RETURNS TABLE("outcome" "text", "link_id" "uuid", "campaign_id" "uuid", "brand_id" "uuid", "expires_at" timestamp with time zone)
+CREATE OR REPLACE FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text", "p_client_key" "text" DEFAULT NULL::"text") RETURNS TABLE("outcome" "text", "link_id" "uuid", "campaign_id" "uuid", "brand_id" "uuid", "expires_at" timestamp with time zone)
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 declare
   l public.share_links%rowtype;
+  v_window timestamptz := to_timestamp(floor(extract(epoch from now()) / 900) * 900);
+  v_attempts integer;
 begin
-  -- Outcomes are returned, not raised: a raise would roll back the attempt count with it.
+  if p_client_key is not null then
+    delete from public.share_unlock_attempts where window_start < now() - interval '1 day';
+    insert into public.share_unlock_attempts as a (client_key, window_start, attempts)
+    values (p_client_key, v_window, 1)
+    on conflict (client_key, window_start) do update set attempts = a.attempts + 1
+    returning attempts into v_attempts;
+    if v_attempts > 30 then
+      return query select 'throttled'::text, null::uuid, null::uuid, null::uuid, null::timestamptz;
+      return;
+    end if;
+  end if;
+
+  -- Outcomes are returned, not raised: a raise would roll back the counts with it.
   -- FOR UPDATE: parallel wrong passwords queue on the row, so the tenth really is the tenth.
   select * into l from public.share_links
   where token_hash = encode(extensions.digest(coalesce(p_token, ''), 'sha256'), 'hex')
@@ -672,7 +695,7 @@ begin
 end $$;
 
 
-ALTER FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text", "p_client_key" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") RETURNS TABLE("audience_count" integer, "audience_definition" "text")
@@ -722,6 +745,31 @@ end $$;
 ALTER FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_password" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+declare
+  v_brand uuid;
+begin
+  select brand_id into v_brand from public.sends where id = p_send_id and status = 'dispatching';
+  if v_brand is null then
+    raise exception 'send is not dispatching' using errcode = 'P0002';
+  end if;
+  insert into public.send_batches (send_id, brand_id, chunk_index, idempotency_key, provider_batch_id, accepted_count, rejected_count, rejection_reasons)
+  values (p_send_id, v_brand, p_chunk_index, p_idempotency_key, p_batch_id,
+          coalesce(array_length(p_accepted, 1), 0), coalesce(array_length(p_rejected, 1), 0), coalesce(p_reasons, '{}'::jsonb))
+  on conflict (send_id, chunk_index) do nothing;
+  update public.send_recipients set status = 'accepted'
+  where send_id = p_send_id and contact_id = any(p_accepted) and status = 'queued';
+  update public.send_recipients set status = 'rejected'
+  where send_id = p_send_id and contact_id = any(p_rejected) and status = 'queued';
+end $$;
+
+
+ALTER FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -741,7 +789,7 @@ end $$;
 ALTER FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS TABLE("queued" integer, "accepted" integer, "rejected" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "total" integer, "events" integer)
+CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS TABLE("queued" integer, "accepted" integer, "rejected" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "total" integer, "events" integer, "batches" integer)
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
@@ -756,7 +804,8 @@ CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS 
     count(*) filter (where status = 'complained')::int,
     count(*) filter (where status = 'unsubscribed')::int,
     count(*)::int,
-    (select count(*)::int from public.provider_events e where e.send_id = p_send_id)
+    (select count(*)::int from public.provider_events e where e.send_id = p_send_id),
+    (select count(*)::int from public.send_batches b where b.send_id = p_send_id)
   from public.send_recipients r where r.send_id = p_send_id
 $$;
 
@@ -1039,6 +1088,28 @@ ALTER TABLE "public"."provider_events" ALTER COLUMN "id" ADD GENERATED ALWAYS AS
 
 
 
+CREATE TABLE IF NOT EXISTS "public"."send_batches" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "send_id" "uuid" NOT NULL,
+    "brand_id" "uuid" NOT NULL,
+    "chunk_index" integer NOT NULL,
+    "idempotency_key" "text" NOT NULL,
+    "provider_batch_id" "text" NOT NULL,
+    "accepted_count" integer DEFAULT 0 NOT NULL,
+    "rejected_count" integer DEFAULT 0 NOT NULL,
+    "rejection_reasons" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "poll_cursor" "text",
+    "last_polled_at" timestamp with time zone,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "send_batches_chunk_index_check" CHECK (("chunk_index" >= 0))
+);
+
+ALTER TABLE ONLY "public"."send_batches" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."send_batches" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."send_log_entries" (
     "id" bigint NOT NULL,
     "brand_id" "uuid" NOT NULL,
@@ -1104,6 +1175,18 @@ ALTER TABLE ONLY "public"."share_links" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."share_links" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."share_unlock_attempts" (
+    "client_key" "text" NOT NULL,
+    "window_start" timestamp with time zone NOT NULL,
+    "attempts" integer DEFAULT 0 NOT NULL
+);
+
+ALTER TABLE ONLY "public"."share_unlock_attempts" FORCE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."share_unlock_attempts" OWNER TO "postgres";
 
 
 ALTER TABLE ONLY "public"."allowed_emails"
@@ -1176,6 +1259,21 @@ ALTER TABLE ONLY "public"."provider_events"
 
 
 
+ALTER TABLE ONLY "public"."send_batches"
+    ADD CONSTRAINT "send_batches_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."send_batches"
+    ADD CONSTRAINT "send_batches_send_id_chunk_index_key" UNIQUE ("send_id", "chunk_index");
+
+
+
+ALTER TABLE ONLY "public"."send_batches"
+    ADD CONSTRAINT "send_batches_send_id_provider_batch_id_key" UNIQUE ("send_id", "provider_batch_id");
+
+
+
 ALTER TABLE ONLY "public"."send_log_entries"
     ADD CONSTRAINT "send_log_entries_brand_id_batch_key_attempt_no_key" UNIQUE ("brand_id", "batch_key", "attempt_no");
 
@@ -1216,6 +1314,11 @@ ALTER TABLE ONLY "public"."share_links"
 
 
 
+ALTER TABLE ONLY "public"."share_unlock_attempts"
+    ADD CONSTRAINT "share_unlock_attempts_pkey" PRIMARY KEY ("client_key", "window_start");
+
+
+
 CREATE INDEX "campaigns_brand_sent_idx" ON "public"."campaigns" USING "btree" ("brand_id", "sent_at" DESC);
 
 
@@ -1245,6 +1348,10 @@ CREATE INDEX "import_rejects_import_idx" ON "public"."import_rejects" USING "btr
 
 
 CREATE INDEX "imports_brand_started_idx" ON "public"."imports" USING "btree" ("brand_id", "started_at" DESC);
+
+
+
+CREATE INDEX "send_batches_send_idx" ON "public"."send_batches" USING "btree" ("send_id", "chunk_index");
 
 
 
@@ -1363,6 +1470,16 @@ ALTER TABLE ONLY "public"."provider_events"
 
 ALTER TABLE ONLY "public"."provider_events"
     ADD CONSTRAINT "provider_events_send_id_fkey" FOREIGN KEY ("send_id") REFERENCES "public"."sends"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."send_batches"
+    ADD CONSTRAINT "send_batches_brand_id_fkey" FOREIGN KEY ("brand_id") REFERENCES "public"."brands"("id");
+
+
+
+ALTER TABLE ONLY "public"."send_batches"
+    ADD CONSTRAINT "send_batches_send_id_fkey" FOREIGN KEY ("send_id") REFERENCES "public"."sends"("id") ON DELETE CASCADE;
 
 
 
@@ -1485,6 +1602,13 @@ CREATE POLICY "provider_events_select_own_brand" ON "public"."provider_events" F
 
 
 
+ALTER TABLE "public"."send_batches" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "send_batches_select_own_brand" ON "public"."send_batches" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
+
+
+
 ALTER TABLE "public"."send_log_entries" ENABLE ROW LEVEL SECURITY;
 
 
@@ -1511,6 +1635,9 @@ ALTER TABLE "public"."share_links" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "share_links_select_own_brand" ON "public"."share_links" FOR SELECT TO "authenticated" USING (("brand_id" IN ( SELECT "app"."user_brand_ids"() AS "user_brand_ids")));
 
+
+
+ALTER TABLE "public"."share_unlock_attempts" ENABLE ROW LEVEL SECURITY;
 
 
 GRANT USAGE ON SCHEMA "app" TO "authenticated";
@@ -1572,8 +1699,8 @@ GRANT ALL ON FUNCTION "public"."campaign_performance"() TO "authenticated";
 
 
 
-REVOKE ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[]) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_expected_batches" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."complete_dispatch"("p_send_id" "uuid", "p_expected_batches" integer) TO "service_role";
 
 
 
@@ -1609,8 +1736,8 @@ GRANT ALL ON FUNCTION "public"."ingest_provider_events"("p_send_id" "uuid", "p_e
 
 
 
-REVOKE ALL ON FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text", "p_client_key" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."open_share_link"("p_token" "text", "p_password" "text", "p_client_key" "text") TO "service_role";
 
 
 
@@ -1623,6 +1750,11 @@ GRANT ALL ON FUNCTION "public"."preview_send_audience"("p_campaign_id" "uuid") T
 REVOKE ALL ON FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_password" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_password" "text") TO "service_role";
 GRANT ALL ON FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_password" "text") TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") TO "service_role";
 
 
 
@@ -1705,6 +1837,11 @@ GRANT ALL ON SEQUENCE "public"."provider_events_id_seq" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."send_batches" TO "service_role";
+GRANT SELECT ON TABLE "public"."send_batches" TO "authenticated";
+
+
+
 GRANT ALL ON TABLE "public"."send_log_entries" TO "service_role";
 GRANT SELECT ON TABLE "public"."send_log_entries" TO "authenticated";
 
@@ -1756,6 +1893,10 @@ GRANT SELECT("failed_attempts") ON TABLE "public"."share_links" TO "authenticate
 
 
 GRANT SELECT("locked_until") ON TABLE "public"."share_links" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."share_unlock_attempts" TO "service_role";
 
 
 

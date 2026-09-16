@@ -5,8 +5,7 @@ import { createHmac, createHash, timingSafeEqual } from 'node:crypto';
  * password; scoped to that link's path; signed so the page can trust the link id inside it
  * without another password round-trip. One hour, then the viewer types the password again.
  *
- * The signing key is derived from the service-role key with a fixed label, so no extra secret
- * has to be provisioned and a leaked cookie key cannot be turned back into the service key.
+ * Signed with SHARE_COOKIE_SECRET, a secret used for nothing else.
  */
 export const SHARE_COOKIE_TTL_SECONDS = 60 * 60;
 
@@ -18,12 +17,8 @@ export function shareCookieName(token: string): string {
   return `share_${tokenHash(token).slice(0, 16)}`;
 }
 
-function key(secret: string): Buffer {
-  return createHmac('sha256', secret).update('share-cookie-v1').digest();
-}
-
 function sign(secret: string, payload: string): string {
-  return createHmac('sha256', key(secret)).update(payload).digest('base64url');
+  return createHmac('sha256', secret).update(payload).digest('base64url');
 }
 
 export function makeShareCookie(
