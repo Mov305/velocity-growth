@@ -284,6 +284,7 @@ Each stage is one commit, made only when asked.
 | 2026-09-16 | The share unlock is throttled per connection (30 calls per 15 minutes, keyed on a hash of the address Vercel reports in `x-vercel-forwarded-for` or `x-real-ip`, never the client-supplied first entry of `x-forwarded-for`) as well as per link | The per-link lock alone allowed unlimited guesses across many links from one machine. The security review caught the first version reading the spoofable entry.                                                                                                           |
 | 2026-09-16 | The share cookie has its own secret, `SHARE_COOKIE_SECRET`                                                                                                                                                                                       | Rotating it signs every viewer out without touching the service-role key. Replaces the derived-key shortcut from earlier today.                                                                                                                                           |
 | 2026-09-16 | Polling walks batches least-recently-polled first under a 50-second budget; one batch's error does not abort the run; a provider 503 ends it early                                                                                               | The first 72-batch poll hit a 503 after 22 batches and the old code would have restarted from batch 1 every minute, never reaching the end. `tests/rls/dispatch.test.ts` fails one batch's feedback and asserts the next run finishes the walk.                           |
+| 2026-09-16 | Owners can upload a CSV from the Imports page (`POST /api/imports`, up to 4 MB); it runs the same pipeline as the CLI, brand from the membership row, kind from an allow-list                                                                    | Asked for on the day. The CLI stays for the seed files, which exceed the platform's request body limit. `tests/e2e/imports.spec.ts` uploads a file with one bad row, checks the counts and the reason, and re-uploads it.                                                 |
 
 ## 8. Running it
 
@@ -307,7 +308,7 @@ pnpm poll:schedule     # register the pg_cron job that polls provider feedback (
 - Environment on Vercel (production and preview): `NEXT_PUBLIC_SUPABASE_URL`, `NEXT_PUBLIC_SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `DATABASE_URL`, `PROVIDER_BASE_URL`, `PROVIDER_API_KEY`, `POLL_SECRET`, `SHARE_COOKIE_SECRET`, `NEXT_PUBLIC_SITE_URL`. Set with `vercel env add` from the local env file; none of them are in the repo.
 - Polling: `app.schedule_provider_poll(url, secret)` stores both values in Supabase Vault and schedules the pg_cron job `poll-provider-feedback` (`* * * * *`), which runs `net.http_post` against `POST /api/poll` with the `x-poll-secret` header. Registered on the hosted project on 2026-09-16 with `ENV_FILE=.env.production pnpm poll:schedule`.
 
-One file at a time: `pnpm import:seed --brand KAROO --kind contacts --file data/seed/karoo-contacts.csv`. Every run writes an `imports` row and one `import_rejects` row per refused line, with the line number, the reason, and the raw values.
+One file at a time: `pnpm import:seed --brand KAROO --kind contacts --file data/seed/karoo-contacts.csv`. From the portal: an owner picks the kind and a CSV up to 4 MB on the Imports page; the same pipeline runs and the load's page opens with its counts and rejects. Every run writes an `imports` row and one `import_rejects` row per refused line, with the line number, the reason, and the raw values.
 
 ## 9. AI tools
 
@@ -321,4 +322,4 @@ Claude Code (Fable 5.1) with project-scoped agents for review, security review, 
 
 **The number I am least sure of.** Marrakech's dashboard "observed" opens and clicks. 633 of 940 Marrakech log rows were rejected because their contact or campaign id matches nothing in the seed, so the observed columns for that brand describe a third of the file. The brand's own reported figures sit beside them so the gap is visible.
 
-**Unfinished.** Marrakech's orphan events are rejected with a reason rather than parked (a decision); imports run from the CLI, not an upload screen; the poll job walks every recent send in one run.
+**Unfinished.** Marrakech's orphan events are rejected with a reason rather than parked (a decision); seed files over 4 MB load through the CLI, the upload screen takes smaller ones; the poll job walks every recent send in one run.

@@ -25,8 +25,11 @@ export type Sql = postgres.Sql;
 export type RunImportOptions = {
   brandCode: string;
   kind: ImportKind;
-  filePath: string;
   sql: Sql;
+  /** A file on disk (the CLI) ... */
+  filePath?: string;
+  /** ... or bytes already in memory (an upload). One of the two. */
+  source?: { fileName: string; bytes: Uint8Array };
 };
 
 const BATCH = {
@@ -59,10 +62,11 @@ function split<T>(results: MapResult<T>[]): { rows: T[]; rejects: Reject[] } {
  * rejects together, is one transaction: a crash leaves nothing half-loaded.
  */
 export async function runImport(opts: RunImportOptions): Promise<ImportSummary> {
-  const { sql, brandCode, kind, filePath } = opts;
+  const { sql, brandCode, kind } = opts;
+  if (!opts.filePath && !opts.source) throw new Error('runImport needs filePath or source');
   const started = Date.now();
-  const fileName = basename(filePath);
-  const bytes = readFileSync(filePath);
+  const fileName = opts.source?.fileName ?? basename(opts.filePath!);
+  const bytes = opts.source?.bytes ?? readFileSync(opts.filePath!);
   const sha256 = createHash('sha256').update(bytes).digest('hex');
 
   const [brand] = await sql<

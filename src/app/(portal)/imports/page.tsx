@@ -1,6 +1,8 @@
 import type { Metadata } from 'next';
 import Link from 'next/link';
 import { createClient } from '@/lib/supabase/server';
+import { getMembership } from '@/lib/auth/membership';
+import { UploadForm } from './upload-form';
 import { listImports } from '@/lib/queries/imports';
 import { fmtDateTime, fmtNum } from '@/components/data/format';
 import { EmptyState, Footnote, PageHeader } from '@/components/data/states';
@@ -21,9 +23,22 @@ const STATUS_CLASS: Record<string, string> = {
   running: 'text-warn',
 };
 
-export default async function ImportsPage() {
-  const supabase = await createClient();
+const UPLOAD_ERRORS: Record<string, string> = {
+  'owner-only': 'Only an owner can import a file.',
+  'bad-form': 'The upload did not arrive as a form. Try again.',
+  'bad-kind': 'Choose what the file contains: contacts, campaigns, events or send log.',
+  'no-file': 'Choose a CSV file first.',
+  'too-large': 'That file is over 4 MB. Files that size load through the CLI (README section 8).',
+  'not-csv': 'Only .csv files are accepted.',
+  failed:
+    'The file could not be loaded. Nothing from it was stored; the failed load is listed below with its reason.',
+};
+
+export default async function ImportsPage({ searchParams }: PageProps<'/imports'>) {
+  const [supabase, m, params] = await Promise.all([createClient(), getMembership(), searchParams]);
   const { rows: imports, total } = await listImports(supabase);
+  const code = typeof params.error === 'string' ? params.error : undefined;
+  const uploadError = code ? (UPLOAD_ERRORS[code] ?? 'The upload failed.') : undefined;
 
   return (
     <>
@@ -43,6 +58,24 @@ export default async function ImportsPage() {
         skipped + already present. Open a load to see each refused row with its line number and
         reason.
       </Footnote>
+
+      <section className="rise rise-2 mt-6 rounded-sm border border-rule bg-card p-6">
+        <h3 className="text-lg">Import a file</h3>
+        <p className="mt-1 text-sm text-muted-foreground">
+          A CSV in this brand&rsquo;s own layout, up to 4 MB. Every row is checked before anything
+          is stored; refused rows are listed with their line number and reason, and loading the same
+          file twice changes nothing. Larger files load through the CLI (README section 8).
+        </p>
+        <div className="mt-4">
+          {m?.role === 'owner' ? (
+            <UploadForm error={uploadError} />
+          ) : (
+            <p className="rounded-sm border border-dashed border-rule px-4 py-3 text-sm text-muted-foreground">
+              Only an owner can import a file. Your login is an analyst.
+            </p>
+          )}
+        </div>
+      </section>
 
       {imports.length === 0 ? (
         <div className="mt-6">
