@@ -348,6 +348,18 @@ ALTER TABLE ONLY "public"."import_rejects" FORCE ROW LEVEL SECURITY;
 ALTER TABLE "public"."import_rejects" OWNER TO "postgres";
 
 
+CREATE OR REPLACE VIEW "public"."import_reject_summary" WITH ("security_invoker"='true') AS
+ SELECT "import_id",
+    "brand_id",
+    "regexp_replace"("reason", '^(unknown campaign|unknown contact) .+$'::"text", '\1 …'::"text") AS "reason",
+    ("count"(*))::integer AS "rows"
+   FROM "public"."import_rejects" "r"
+  GROUP BY "import_id", "brand_id", ("regexp_replace"("reason", '^(unknown campaign|unknown contact) .+$'::"text", '\1 …'::"text"));
+
+
+ALTER VIEW "public"."import_reject_summary" OWNER TO "postgres";
+
+
 ALTER TABLE "public"."import_rejects" ALTER COLUMN "id" ADD GENERATED ALWAYS AS IDENTITY (
     SEQUENCE NAME "public"."import_rejects_id_seq"
     START WITH 1
@@ -991,6 +1003,11 @@ GRANT ALL ON SEQUENCE "public"."engagement_events_id_seq" TO "service_role";
 
 GRANT ALL ON TABLE "public"."import_rejects" TO "service_role";
 GRANT SELECT ON TABLE "public"."import_rejects" TO "authenticated";
+
+
+
+GRANT ALL ON TABLE "public"."import_reject_summary" TO "service_role";
+GRANT SELECT ON TABLE "public"."import_reject_summary" TO "authenticated";
 
 
 

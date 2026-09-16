@@ -761,7 +761,30 @@ export type Database = {
       }
     }
     Views: {
-      [_ in never]: never
+      import_reject_summary: {
+        Row: {
+          brand_id: string | null
+          import_id: string | null
+          reason: string | null
+          rows: number | null
+        }
+        Relationships: [
+          {
+            foreignKeyName: "import_rejects_brand_id_fkey"
+            columns: ["brand_id"]
+            isOneToOne: false
+            referencedRelation: "brands"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "import_rejects_import_id_fkey"
+            columns: ["import_id"]
+            isOneToOne: false
+            referencedRelation: "imports"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
     }
     Functions: {
       [_ in never]: never

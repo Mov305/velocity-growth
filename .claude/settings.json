@@ -2,8 +2,6 @@
   "permissions": {
     "defaultMode": "bypassPermissions",
     "deny": [
-      "Bash(git push*)",
-      "Bash(git commit --amend*)",
       "Bash(git reset --hard*)",
       "Bash(git rebase*)",
       "Bash(git branch -D*)",
