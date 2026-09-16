@@ -1,10 +1,15 @@
 import type { NextConfig } from 'next';
 
 // Next needs inline scripts for hydration; everything else is locked to this origin plus
-// Supabase. The portal is never framed.
+// Supabase. The portal is never framed. React's development build reconstructs call stacks
+// with eval(), so that one keyword is added in development and never in production.
+const scriptSrc =
+  process.env.NODE_ENV === 'development'
+    ? "script-src 'self' 'unsafe-inline' 'unsafe-eval'"
+    : "script-src 'self' 'unsafe-inline'";
 const csp = [
   "default-src 'self'",
-  "script-src 'self' 'unsafe-inline'",
+  scriptSrc,
   "style-src 'self' 'unsafe-inline'",
   "img-src 'self' data:",
   "font-src 'self'",
