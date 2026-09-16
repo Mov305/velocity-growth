@@ -15,7 +15,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
-  timeout: 30_000,
+  timeout: remote ? 90_000 : 30_000,
+  expect: { timeout: remote ? 20_000 : 5_000 },
   reporter: [['list']],
   use: {
     baseURL: remote ?? 'http://localhost:3000',

@@ -303,3 +303,13 @@ One file at a time: `pnpm import:seed --brand KAROO --kind contacts --file data/
 ## 9. AI tools
 
 Claude Code (Fable 5.1) with project-scoped agents for review, security review, testing and linting. Every generated change is run through those agents before the user decides whether to commit. All commits are authored by the engineer alone.
+
+## 10. Submission note
+
+**What I tried to break.** The provider first: `scripts/verify-provider.ts` sent three-recipient batches with and without an `Idempotency-Key`, replayed a key with a different body, passed bogus `since` values and followed `next_cursor`. Measured: the key alone decides the batch, `since` is ignored, every event arrives twice and out of order, and one response carried a forged event for a non-UUID recipient. Then the send path: two `dispatchSend` calls at once against one approved send produced one provider call (advisory lock plus a single-winner `UPDATE`), and a `readAudience` that stopped at PostgREST's 1,000-row cap would have failed every Kilele send, so it pages. Then the shared link: twelve parallel wrong passwords all passed the ten-try lock until the row was read `FOR UPDATE`. Then the users: the RLS suite signs in as each of the six and reads the other brands; the catalog test fails if a policy or forced-RLS flag is dropped.
+
+**Where isolation lives.** `supabase/migrations/20260914000200_rls.sql`, lines 70 to 106: RLS enabled and forced on every table in `public`, one `select` policy per tenant table on `brand_id in (select app.user_brand_ids())`, no client role holds insert, update or delete on any table.
+
+**The number I am least sure of.** Marrakech's dashboard "observed" opens and clicks. 633 of 940 Marrakech log rows were rejected because their contact or campaign id matches nothing in the seed, so the observed columns for that brand describe a third of the file. The brand's own reported figures sit beside them so the gap is visible.
+
+**Unfinished.** No per-IP rate limit on the share unlock (the lock is per link); the share cookie key is derived from the service-role key rather than its own secret; the Marrakech orphan events are rejected with a reason rather than held for a later match; there is no bulk export.
