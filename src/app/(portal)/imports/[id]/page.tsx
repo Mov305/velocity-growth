@@ -72,6 +72,14 @@ export default async function ImportDetailPage({
           <dt className="text-muted-foreground">already present</dt>
           <dd>{fmtNum(imp.rows_already_present)}</dd>
         </div>
+        {imp.kind === 'contacts' ? (
+          <div>
+            <dt className="text-muted-foreground">opt-outs kept</dt>
+            <dd className={imp.rows_opt_out_kept > 0 ? 'text-warn' : ''}>
+              {fmtNum(imp.rows_opt_out_kept)}
+            </dd>
+          </div>
+        ) : null}
       </dl>
       <Footnote n={1}>
         {imp.status === 'succeeded'
@@ -82,6 +90,11 @@ export default async function ImportDetailPage({
             ? `This load failed and stored nothing: ${imp.error ?? 'no reason recorded'}.`
             : 'This load is still running.'}
       </Footnote>
+      {imp.rows_opt_out_kept > 0 ? (
+        <Footnote n={2}>
+          {`${fmtNum(imp.rows_opt_out_kept)} contacts in this file disagreed with a stored opt-out: the file tried to make an unsubscribed or bounced contact active, raise consent the stored row does not give, undelete a contact, or shorten or clear a suppression still in force. An import never undoes an opt-out, so the stored value was kept; their other fields were updated. They are counted in upserted and flagged “opt-out kept” on the Contacts page.`}
+        </Footnote>
+      ) : null}
 
       {summary.length > 0 ? (
         <div className="rise rise-3 mt-8">

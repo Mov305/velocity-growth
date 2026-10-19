@@ -76,9 +76,27 @@ export class ProviderError extends Error {
   constructor(
     message: string,
     public readonly status?: number,
+    /** Seconds the provider asked us to wait (Retry-After header or a `retry_after` body field). */
+    public readonly retryAfterSeconds?: number,
   ) {
     super(message);
     this.name = 'ProviderError';
+  }
+}
+
+/**
+ * Measured 2026-09-16: the events endpoint's 503 carries `{"retry_after": 22}` in the body. The
+ * documented 429 is assumed to do the same or send a Retry-After header (not measured: the rate
+ * limit was never reached). Anything unparseable is undefined, never a guess.
+ */
+function retryAfterOf(res: Response, body: string): number | undefined {
+  const header = Number(res.headers.get('retry-after'));
+  if (Number.isFinite(header) && header > 0) return header;
+  try {
+    const v = (JSON.parse(body) as { retry_after?: unknown }).retry_after;
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -142,6 +160,7 @@ export async function fetchEvents(
     throw new ProviderError(
       `provider events failed: HTTP ${res.status} ${text.slice(0, 200)}`,
       res.status,
+      retryAfterOf(res, text),
     );
   const parsed = EventsResponse.safeParse(JSON.parse(text));
   if (!parsed.success)

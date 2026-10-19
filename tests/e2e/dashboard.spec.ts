@@ -20,7 +20,11 @@ test('four numbers with footnotes that add up, for the big brand', async ({ page
   expect(num(deleted)).toBeGreaterThan(0);
   await expect(page.getByText(/Contactable means status active, consent given/)).toBeVisible();
   await expect(page.getByText(/whose deleted-at is empty/)).toBeVisible();
-  await expect(page.getByRole('img', { name: /Signups per day/ })).toBeVisible();
+  // The seed's newest Kilele signups are from August 2026, so whether the 30-day window holds any
+  // depends on the day the suite runs. Either the chart or the explicit empty state must show.
+  await expect(
+    page.getByRole('img', { name: /Signups per day/ }).or(page.getByText(/Thirty days, all zero/)),
+  ).toBeVisible();
   await expect(page.getByText('Reported by brand')).toBeVisible();
   await expect(page.getByText('Observed in event log')).toBeVisible();
   await expect(page.locator('section').last().locator('tbody tr')).toHaveCount(44);

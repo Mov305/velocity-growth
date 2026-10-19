@@ -45,7 +45,7 @@ test('owner publishes; a stranger needs the password; revoke closes it', async (
   await s.getByLabel('Password').fill('grader-password-1');
   await s.getByRole('button', { name: 'Open results' }).click();
   await expect(s.getByText('Shared read-only view')).toBeVisible();
-  await expect(s.locator('p', { hasText: /^Sent from this portal/ })).toBeVisible();
+  await expect(s.locator('p', { hasText: /^Approved for sending from this portal/ })).toBeVisible();
   await expect(s.locator('p', { hasText: /^Engagement log/ })).toBeVisible();
   // Nothing on the page is a person.
   await expect(s.getByText(/@/)).toHaveCount(0);

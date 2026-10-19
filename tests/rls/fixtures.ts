@@ -1,7 +1,11 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { rlsEnv } from './setup';
 
-/** Every table that carries brand_id. brands, memberships and allowed_emails are tested separately. */
+/**
+ * Every public table that carries brand_id, except memberships and allowed_emails, which are tested
+ * separately (brands is keyed by id). catalog.test.ts fails if a table with a brand_id column is
+ * missing here, so a new tenant table cannot skip the isolation suite.
+ */
 export const TENANT_TABLES = [
   'imports',
   'import_rejects',
@@ -10,10 +14,13 @@ export const TENANT_TABLES = [
   'engagement_events',
   'send_log_entries',
   'sends',
+  'send_batches',
   'send_recipients',
   'provider_events',
   'share_links',
 ] as const;
+/** brand_id tables deliberately outside TENANT_TABLES, each with its own test in isolation.test.ts. */
+export const BRAND_ID_TABLES_TESTED_SEPARATELY = ['allowed_emails', 'memberships'] as const;
 export type TenantTable = (typeof TENANT_TABLES)[number];
 
 export const MARK = 'rls-fixture';
@@ -131,6 +138,16 @@ export async function seedFixtures(
       .single();
     if (send.error) throw send.error;
 
+    const sb = await admin.from('send_batches').insert({
+      send_id: send.data.id,
+      brand_id: b.id,
+      chunk_index: 0,
+      idempotency_key: `${MARK}-${b.code}`,
+      provider_batch_id: `${MARK}-${b.code}`,
+      submitted_count: 0,
+    });
+    if (sb.error) throw sb.error;
+
     const sr = await admin
       .from('send_recipients')
       .insert({ send_id: send.data.id, contact_id: contact.data.id, brand_id: b.id });
@@ -160,7 +177,7 @@ export async function seedFixtures(
 }
 
 export async function cleanFixtures(admin: SupabaseClient) {
-  // Order respects foreign keys. Cascades: imports -> import_rejects; sends -> send_recipients, provider_events.
+  // Order respects foreign keys. Cascades: imports -> import_rejects; sends -> send_batches, send_recipients, provider_events.
   const steps: Array<[TenantTable, Record<string, unknown>]> = [
     ['share_links', { password_hash: MARK }],
     ['sends', { audience_definition: MARK }],

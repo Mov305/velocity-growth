@@ -142,7 +142,14 @@ describe('ingest_provider_events', () => {
       { contact_id: string }[]
     >`select contact_id from public.send_recipients where send_id = ${sendId!} limit 2`;
     const [r1, r2] = rec.map((r) => r.contact_id);
-    await sql`select public.record_send_batch(${sendId!}, 0, 'key-test-ingest', 'batch_test_ingest', ${[r1, r2]}::uuid[], ${[]}::uuid[], '{}'::jsonb)`;
+    // One batch holding the whole audience; the provider names only r1 and r2 as accepted, so
+    // the rest are recorded as unaccounted rather than left queued.
+    const members = (
+      await sql<
+        { contact_id: string }[]
+      >`select contact_id from public.send_recipients where send_id = ${sendId!}`
+    ).map((r) => r.contact_id);
+    await sql`select public.record_send_batch(${sendId!}, 0, 'key-test-ingest', 'batch_test_ingest', ${members}::uuid[], ${[r1, r2]}::uuid[], ${[]}::uuid[], '{}'::jsonb, 0)`;
     await sql`select public.complete_dispatch(${sendId!}, 1)`;
 
     const events = [
@@ -182,7 +189,7 @@ describe('ingest_provider_events', () => {
     const [r3] = (
       await sql<
         { contact_id: string }[]
-      >`select contact_id from public.send_recipients where send_id = ${sendId!} and status = 'queued' limit 1`
+      >`select contact_id from public.send_recipients where send_id = ${sendId!} and status = 'unaccounted' limit 1`
     ).map((r) => r.contact_id);
     await sql`update public.send_recipients set status = 'rejected' where send_id = ${sendId!} and contact_id = ${r3}`;
     await sql`select * from public.ingest_provider_events(${sendId!}, ${sql.json([{ event_id: 'e-late', type: 'delivered', recipient_id: r3 }])})`;

@@ -7,11 +7,14 @@ import { createClient } from '@/lib/supabase/server';
 import { fmtDateTime, fmtNum } from '@/components/data/format';
 import { Footnote, PageHeader } from '@/components/data/states';
 import { serverNowMs } from '@/lib/time';
-import { describeSendError } from '@/lib/send/describe-error';
+import { describeDispatchProgress, describeSendError } from '@/lib/send/describe-error';
+import { PROVIDER_BATCH_CAP } from '@/lib/provider/client';
 import { SendControls } from './send-controls';
 
 export const metadata: Metadata = { title: 'Send' };
-// The poll-now action walks provider batches under a time budget; this is the platform ceiling.
+// Both actions on this page work under a time budget inside this ceiling: poll-now walks provider
+// batches for up to 50 s, confirm starts no new 500-recipient chunk after 25 s (a chunk can take
+// the provider's 30 s timeout) and leaves the rest for a resume.
 export const maxDuration = 60;
 
 const STATUS_TEXT: Record<string, string> = {
@@ -19,7 +22,6 @@ const STATUS_TEXT: Record<string, string> = {
   dispatching:
     'Being handed to the provider. If this has said so for more than five minutes, the process died and an owner can retry safely: the same idempotency key means the provider cannot send twice.',
   dispatched: 'Handed to the provider. Feedback below updates as it arrives.',
-  failed: 'The provider did not accept it. Nothing was sent. It can be retried.',
 };
 
 export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
@@ -40,7 +42,7 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
   const batches = await supabase
     .from('send_batches')
     .select(
-      'chunk_index, provider_batch_id, accepted_count, rejected_count, rejection_reasons, last_polled_at',
+      'chunk_index, provider_batch_id, submitted_count, accepted_count, rejected_count, unaccounted_count, unidentified_rejections, rejection_reasons, last_polled_at',
       {
         count: 'exact',
       },
@@ -50,15 +52,70 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
     .range(0, 199);
   if (batches.error) throw new Error(`send batches lookup failed: ${batches.error.message}`);
 
+  const incomplete = await supabase
+    .from('send_batches')
+    .select('chunk_index', { count: 'exact', head: true })
+    .eq('send_id', id)
+    .eq('poll_incomplete', true);
+  if (incomplete.error)
+    throw new Error(`send batches poll state lookup failed: ${incomplete.error.message}`);
+  if (incomplete.count === null) throw new Error('send batches poll state returned no count');
+  const truncatedBatches = incomplete.count;
+
   const outcomes = await supabase.rpc('send_outcomes', { p_send_id: id });
   if (outcomes.error) throw new Error(`send outcomes failed: ${outcomes.error.message}`);
   const o = outcomes.data?.[0];
   if (!o) throw new Error('send outcomes returned no row');
 
+  // Batches this send needs: chunks of the frozen audience with at least one recipient who is
+  // not withheld. A chunk whose members were all withheld is never posted, so it is not counted.
+  const needed = await supabase.rpc('send_batches_needed', {
+    p_send_id: id,
+    p_cap: PROVIDER_BATCH_CAP,
+  });
+  if (needed.error) throw new Error(`send batch count failed: ${needed.error.message}`);
+  const totalBatches = needed.data;
+
+  const handedOver = o.total - o.queued - o.withheld;
+  const paused = s.status === 'failed' && (s.last_error ?? '').startsWith('paused:');
+  // Failed with no batch recorded and nobody queued: every approved recipient was withheld (or
+  // the audience was empty). There is nothing to retry; approving the campaign again freezes a
+  // new audience under a new send.
+  const nothingLeft = s.status === 'failed' && o.batches === 0 && o.queued === 0;
+  // A stopped send is described from what is recorded, never as "nothing was sent" when a batch
+  // already reached the provider.
+  const statusText = nothingLeft
+    ? `Nothing left to hand over: every approved recipient became uncontactable after approval, so no batch was posted by this send. ${describeDispatchProgress(
+        { recordedBatches: 0, totalBatches, handedOver: 0, remaining: 0 },
+      )} Approving the campaign again freezes a new audience under a new send.`
+    : s.status === 'failed'
+      ? `${paused ? 'Paused partway through the hand-over.' : 'The hand-over stopped before it finished.'} ${describeDispatchProgress(
+          {
+            recordedBatches: o.batches,
+            totalBatches,
+            handedOver,
+            remaining: o.queued,
+          },
+        )}`
+      : (STATUS_TEXT[s.status] ?? s.status);
+  const withheldReasons = Object.entries((o.withheld_reasons ?? {}) as Record<string, number>)
+    .map(([k, v]) => `${k} ${fmtNum(v)}`)
+    .join(', ');
+
   const rows: Array<[string, number, string]> = [
     ['Queued', o.queued, 'approved, not yet handed to the provider'],
+    [
+      'Withheld',
+      o.withheld,
+      'approved, then no longer contactable when the send was handed over; never sent',
+    ],
     ['Accepted', o.accepted, 'provider took it, no delivery report yet'],
     ['Rejected', o.rejected, 'provider refused it at hand-over'],
+    [
+      'Unaccounted',
+      o.unaccounted,
+      "handed over, but the provider's answer named it neither accepted nor rejected; not re-sent, outcome unknown until a report arrives",
+    ],
     ['Delivered', o.delivered, 'provider reported delivery'],
     ['Opened', o.opened, 'provider reported an open'],
     ['Clicked', o.clicked, 'provider reported a click'],
@@ -75,7 +132,7 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
         </Link>
       </p>
       <PageHeader
-        eyebrow={`send · ${s.status}`}
+        eyebrow={`send · ${paused ? 'paused' : s.status}`}
         title={
           <>
             {campaign?.external_id} <span className="text-muted-foreground">{campaign?.name}</span>
@@ -83,12 +140,18 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
         }
       />
 
-      <section className="rise grid gap-3 sm:grid-cols-3">
+      <section className="rise grid gap-3 sm:grid-cols-4">
         <div className="rounded-sm border border-rule bg-card p-4">
           <p className="text-xs text-muted-foreground">
             Approved audience<span className="fn">1</span>
           </p>
           <p className="mt-1 font-mono text-3xl">{fmtNum(s.approved_count)}</p>
+        </div>
+        <div className="rounded-sm border border-rule bg-card p-4">
+          <p className="text-xs text-muted-foreground">
+            Withheld at hand-over<span className="fn">3</span>
+          </p>
+          <p className="mt-1 font-mono text-3xl">{fmtNum(o.withheld)}</p>
         </div>
         <div className="rounded-sm border border-rule bg-card p-4">
           <p className="text-xs text-muted-foreground">
@@ -101,6 +164,11 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
           <p className="mt-1 font-mono text-3xl">{fmtNum(o.events)}</p>
         </div>
       </section>
+      <p className="mt-3 text-sm">
+        Approved {fmtNum(s.approved_count)}, withheld {fmtNum(o.withheld)} because they became
+        uncontactable after approval, handed to the provider {fmtNum(handedOver)}
+        {o.queued > 0 ? `, not yet handed over ${fmtNum(o.queued)}` : ''}.
+      </p>
       <Footnote n={1}>
         Frozen when the audience was approved on {fmtDateTime(s.approved_at)}:{' '}
         {s.audience_definition}. This number does not change afterwards, whatever happens to the
@@ -112,9 +180,21 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
         key. Accepted is the sum over every batch; rejected recipients and the provider&rsquo;s
         reason are listed per batch below.
       </Footnote>
+      <Footnote n={3}>
+        Approved recipients who were no longer contactable, by the same definition, at the moment
+        the send was handed to the provider. They are never sent and stay counted in the approved
+        audience.{withheldReasons ? ` Why: ${withheldReasons}.` : ''}
+      </Footnote>
 
       <section className="rise rise-2 mt-6 rounded-sm border border-rule bg-card p-4">
-        <p className="text-sm">{STATUS_TEXT[s.status] ?? s.status}</p>
+        <p className="text-sm">{statusText}</p>
+        {truncatedBatches > 0 ? (
+          <p className="mt-2 border-l-2 border-bad pl-3 text-sm">
+            {fmtNum(truncatedBatches)} of {fmtNum(o.batches)} batches have more provider events than
+            one poll reads (20 pages); the next poll continues from where it stopped. Outcomes below
+            are incomplete until then.
+          </p>
+        ) : null}
         <dl className="mt-3 grid grid-cols-2 gap-x-6 gap-y-2 font-mono text-xs sm:grid-cols-4">
           <div>
             <dt className="text-muted-foreground">idempotency key</dt>
@@ -145,6 +225,8 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
             role={m?.role ?? 'analyst'}
             hasBatch={s.provider_batch_id !== null}
             approvedCount={s.approved_count}
+            recordedBatches={o.batches}
+            remaining={o.queued}
             stalled={
               s.status === 'dispatching' &&
               s.provider_batch_id === null &&
@@ -163,14 +245,25 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
               ? ` (showing the first ${fmtNum(batches.data.length)} of ${fmtNum(batches.count)})`
               : ''}
           </p>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Per batch, handed over = accepted + rejected + unaccounted. Unaccounted recipients were
+            in the batch but the provider&rsquo;s answer named them neither way. A rejection that
+            arrives without an id of this batch (an unrecognised shape) is counted beside the
+            rejected figure, not dropped.
+            {o.unidentified_rejections > 0
+              ? ` ${fmtNum(o.unidentified_rejections)} such rejections across this send.`
+              : ''}
+          </p>
           <div className="mt-2 overflow-x-auto">
             <table className="w-full text-xs">
               <thead className="text-left text-muted-foreground">
                 <tr>
                   <th className="py-1 pr-3 font-normal">#</th>
                   <th className="py-1 pr-3 font-normal">batch</th>
+                  <th className="py-1 pr-3 text-right font-normal">handed over</th>
                   <th className="py-1 pr-3 text-right font-normal">accepted</th>
                   <th className="py-1 pr-3 text-right font-normal">rejected</th>
+                  <th className="py-1 pr-3 text-right font-normal">unaccounted</th>
                   <th className="py-1 pr-3 font-normal">reasons</th>
                   <th className="py-1 font-normal">last polled</th>
                 </tr>
@@ -180,8 +273,17 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
                   <tr key={b.chunk_index} className="border-t border-rule">
                     <td className="py-1 pr-3 font-mono">{b.chunk_index + 1}</td>
                     <td className="py-1 pr-3 font-mono break-all">{b.provider_batch_id}</td>
+                    <td className="py-1 pr-3 text-right font-mono">{fmtNum(b.submitted_count)}</td>
                     <td className="py-1 pr-3 text-right font-mono">{fmtNum(b.accepted_count)}</td>
-                    <td className="py-1 pr-3 text-right font-mono">{fmtNum(b.rejected_count)}</td>
+                    <td className="py-1 pr-3 text-right font-mono">
+                      {fmtNum(b.rejected_count)}
+                      {b.unidentified_rejections > 0
+                        ? ` (+${fmtNum(b.unidentified_rejections)} without an id of ours)`
+                        : ''}
+                    </td>
+                    <td className="py-1 pr-3 text-right font-mono">
+                      {fmtNum(b.unaccounted_count)}
+                    </td>
                     <td className="py-1 pr-3">
                       {Object.entries((b.rejection_reasons ?? {}) as Record<string, number>)
                         .map(([k, v]) => `${k} ${fmtNum(v)}`)
@@ -198,9 +300,9 @@ export default async function SendPage({ params }: PageProps<'/sends/[id]'>) {
 
       <section className="rise rise-3 mt-6">
         <h3 className="text-xl">
-          Where each recipient stands<span className="fn">3</span>
+          Where each recipient stands<span className="fn">4</span>
         </h3>
-        <Footnote n={3}>
+        <Footnote n={4}>
           One row per recipient in the frozen audience, at its latest state. States only move
           forward; a bounce, complaint or unsubscribe is final even if a later delivery report
           arrives. Rows add up to the approved audience.

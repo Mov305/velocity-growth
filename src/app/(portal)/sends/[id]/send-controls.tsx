@@ -6,12 +6,16 @@ import { useEffect } from 'react';
 import { Button } from '@/components/ui/button';
 import { confirmSend, pollNow, type ActionState } from '../actions';
 
+const fmt = (x: number) => x.toLocaleString('en-GB');
+
 export function SendControls({
   sendId,
   status,
   role,
   hasBatch,
   approvedCount,
+  recordedBatches,
+  remaining,
   stalled,
 }: {
   sendId: string;
@@ -19,6 +23,10 @@ export function SendControls({
   role: 'owner' | 'analyst';
   hasBatch: boolean;
   approvedCount: number;
+  /** batches already recorded as handed to the provider */
+  recordedBatches: number;
+  /** recipients still queued: what a confirm or resume would hand over now */
+  remaining: number;
   /** dispatching with no batch for more than five minutes: the process died mid-flight */
   stalled: boolean;
 }) {
@@ -33,9 +41,13 @@ export function SendControls({
     if (confirmState.notice || pollState.notice) router.refresh();
   }, [confirmState.notice, pollState.notice, router]);
 
+  // A failed send with no batch recorded and nobody queued has nothing to hand over; a retry
+  // would only fail again. The page tells the owner to approve the campaign again instead.
+  const nothingLeft = status === 'failed' && recordedBatches === 0 && remaining === 0;
   const canConfirm =
     role === 'owner' &&
     !hasBatch &&
+    !nothingLeft &&
     (status === 'approved' || status === 'failed' || (status === 'dispatching' && stalled));
   const canPoll = hasBatch && status === 'dispatched';
   const message = confirmState.error ?? confirmState.notice ?? pollState.error ?? pollState.notice;
@@ -50,11 +62,13 @@ export function SendControls({
             <Button type="submit" disabled={confirming}>
               {confirming
                 ? 'Sending…'
-                : status === 'failed'
-                  ? `Retry send to ${approvedCount.toLocaleString('en-GB')}`
-                  : status === 'dispatching'
-                    ? `Retry stalled send to ${approvedCount.toLocaleString('en-GB')}`
-                    : `Confirm send to ${approvedCount.toLocaleString('en-GB')}`}
+                : status === 'approved'
+                  ? `Confirm send to ${fmt(approvedCount)}`
+                  : recordedBatches > 0
+                    ? `Resume: hand over the remaining ${fmt(remaining)}`
+                    : status === 'dispatching'
+                      ? `Retry stalled send to ${fmt(remaining)}`
+                      : `Retry send to ${fmt(remaining)}`}
             </Button>
           </form>
         ) : null}
@@ -80,8 +94,10 @@ export function SendControls({
       ) : null}
       {canConfirm ? (
         <p className="text-xs text-muted-foreground">
-          Confirming calls the provider once with this send&apos;s idempotency key. Pressing it
-          again, or from another session, cannot send twice.
+          Confirming hands the audience to the provider in batches of 500, each under its own
+          idempotency key derived from this send&apos;s. Pressing it again, or from another session,
+          cannot send twice; a resume skips every batch already recorded. Anyone who became
+          uncontactable since approval is withheld at hand-over and counted separately.
         </p>
       ) : null}
     </div>

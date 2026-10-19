@@ -6,7 +6,7 @@ import { getMembership } from '@/lib/auth/membership';
 import { createClient } from '@/lib/supabase/server';
 import { dispatchSend } from '@/lib/send/dispatch';
 import { POLL_RUN_BUDGET_MS, pollSend } from '@/lib/send/poll';
-import { describeSendError } from '@/lib/send/describe-error';
+import { describeDispatchProgress, describeSendError } from '@/lib/send/describe-error';
 
 const Id = z.string().uuid();
 
@@ -37,25 +37,48 @@ export async function confirmSend(_prev: ActionState, formData: FormData): Promi
   try {
     outcome = await dispatchSend(supabase, parsed.data);
   } catch (e) {
+    // dispatchSend throws only before it has won the send (begin_dispatch or the lookup after
+    // it), so no batch was posted by this call.
     return {
       error:
         e instanceof Error && /not permitted/.test(e.message)
           ? 'Only an owner can send.'
-          : 'The send could not be started. Nothing was sent.',
+          : 'The send could not be started. This attempt handed nothing to the provider.',
     };
   }
   if (outcome.kind === 'failed')
     return {
-      error: `${describeSendError(outcome.error)} Nothing was recorded as sent; you can retry.`,
+      error: `${describeSendError(outcome.error)} ${describeDispatchProgress(outcome.progress)}`,
     };
+  if (outcome.kind === 'paused') {
+    const p = outcome.progress;
+    return {
+      notice: p
+        ? `${n(p.recordedBatches)} of ${n(p.totalBatches)} batches (${n(p.handedOver)} recipients) handed to the provider so far. One request may run for 60 seconds, so this one stopped there; press Resume to hand over the remaining ${n(p.remaining)}. Recorded batches are never posted again.`
+        : `${describeSendError('paused:')} ${describeDispatchProgress(null)}`,
+    };
+  }
   if (outcome.kind === 'already')
     return {
       notice: `This send is already ${outcome.status}${outcome.batchId ? ` (provider batch ${outcome.batchId})` : ''}. It was not sent again.`,
     };
+  const extra = [
+    outcome.withheld
+      ? `${n(outcome.withheld)} withheld because they became uncontactable after approval`
+      : '',
+    outcome.unaccounted
+      ? `${n(outcome.unaccounted)} named neither accepted nor rejected by the provider`
+      : '',
+    outcome.unidentifiedRejections
+      ? `${n(outcome.unidentifiedRejections)} rejections arrived without a recipient id of ours`
+      : '',
+  ].filter(Boolean);
   return {
-    notice: `Sent in ${outcome.batches.toLocaleString('en-GB')} provider ${outcome.batches === 1 ? 'batch' : 'batches'}. The provider accepted ${outcome.accepted.toLocaleString('en-GB')} and rejected ${outcome.rejected.toLocaleString('en-GB')}; first batch ${outcome.batchId}.`,
+    notice: `Sent in ${n(outcome.batches)} provider ${outcome.batches === 1 ? 'batch' : 'batches'}. The provider accepted ${n(outcome.accepted)} and rejected ${n(outcome.rejected)}; first batch ${outcome.batchId}.${extra.length ? ` Also: ${extra.join('; ')}.` : ''}`,
   };
 }
+
+const n = (x: number) => x.toLocaleString('en-GB');
 
 /** Owner or analyst may pull feedback on demand; the scheduler does the same once a minute. */
 export async function pollNow(_prev: ActionState, formData: FormData): Promise<ActionState> {
@@ -68,7 +91,16 @@ export async function pollNow(_prev: ActionState, formData: FormData): Promise<A
   const visible = await supabase.from('sends').select('id').eq('id', parsed.data).maybeSingle();
   if (visible.error || !visible.data) return { error: 'That send is not in your brand.' };
   const r = await pollSend(parsed.data, { deadlineMs: Date.now() + POLL_RUN_BUDGET_MS });
-  const progress = `${r.polled} of ${r.batches} batches walked${r.deferred ? `, ${r.deferred} deferred to the next run` : ''}`;
+  const progress = [
+    `${r.polled} of ${r.batches} batches walked`,
+    r.truncated ? `${r.truncated} cut off at 20 pages, resuming next poll` : '',
+    r.deferred ? `${r.deferred} deferred to the next run` : '',
+    r.pausedFor !== undefined
+      ? `provider asked to pause${r.pausedFor !== null ? ` (${r.pausedFor}s)` : ''}`
+      : '',
+  ]
+    .filter(Boolean)
+    .join(', ');
   if (r.error) {
     return {
       error: `${describeSendError(`poll: ${r.error}`) ?? 'Polling failed.'} This run: ${progress}.`,

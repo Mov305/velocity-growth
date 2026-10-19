@@ -1,7 +1,7 @@
 import { NextResponse, type NextRequest } from 'next/server';
 import { timingSafeEqual } from 'node:crypto';
 import { serverEnv } from '@/lib/env';
-import { pollAllDispatched } from '@/lib/send/poll';
+import { POLL_WINDOW_DAYS, countPollableSends, pollAllDispatched } from '@/lib/send/poll';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -26,10 +26,22 @@ export async function POST(request: NextRequest) {
   if (!secretMatches(request.headers.get('x-poll-secret'), env.POLL_SECRET)) {
     return NextResponse.json({ error: 'forbidden' }, { status: 403 });
   }
-  const results = await pollAllDispatched();
+  // Idle check first: with no send inside the feedback window, the minute costs one count query.
+  const pollable = await countPollableSends();
+  if (pollable === 0) {
+    return NextResponse.json({ idle: true, windowDays: POLL_WINDOW_DAYS, polled: 0 });
+  }
+  const { results, pollable: total, skipped, stoppedBy } = await pollAllDispatched();
   return NextResponse.json({
+    idle: false,
+    // pollable = polled + skipped: a send the run did not reach is reported, never left out.
+    pollable: total,
     polled: results.length,
+    skipped,
+    stoppedBy,
     batches: results.reduce((n, r) => n + r.polled, 0),
+    truncated: results.reduce((n, r) => n + r.truncated, 0),
+    paused: results.some((r) => r.pausedFor !== undefined),
     deferred: results.reduce((n, r) => n + r.deferred, 0),
     failed: results.reduce((n, r) => n + r.failed, 0),
     inserted: results.reduce((n, r) => n + r.inserted, 0),

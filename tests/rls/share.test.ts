@@ -261,7 +261,9 @@ describe('opening', () => {
         d.complained +
         d.unsubscribed +
         d.rejected +
-        d.pending,
+        d.pending +
+        d.unaccounted +
+        d.withheld,
     ).toBe(d.approved);
   });
 });

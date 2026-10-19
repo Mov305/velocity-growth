@@ -89,6 +89,7 @@ export async function runImport(opts: RunImportOptions): Promise<ImportSummary> 
     let upserted = 0;
     let skipped = 0;
     let alreadyPresent = 0;
+    let optOutKept = 0;
 
     await sql.begin(async (tx) => {
       const t = tx as unknown as Sql;
@@ -97,7 +98,9 @@ export async function runImport(opts: RunImportOptions): Promise<ImportSummary> 
         for (const rej of r.rejects) rejects.push(rej);
         const d = dedupeLastWins(r.rows, (c) => c.external_id);
         skipped = d.skipped;
-        upserted = await upsertContacts(t, brand.id, importId, d.kept);
+        const res = await upsertContacts(t, brand.id, importId, d.kept);
+        upserted = res.upserted;
+        optOutKept = res.optOutKept;
       } else if (kind === 'campaigns') {
         const { decimalSeparator } = brandConfig(brandCode);
         const r = split(parsed.records.map((rec) => mapCampaign(rec, { decimalSeparator })));
@@ -138,6 +141,7 @@ export async function runImport(opts: RunImportOptions): Promise<ImportSummary> 
           rows_rejected = ${rejects.length},
           rows_skipped_duplicate = ${skipped},
           rows_already_present = ${alreadyPresent},
+          rows_opt_out_kept = ${optOutKept},
           finished_at = now()
         where id = ${importId}`;
     });
@@ -153,6 +157,7 @@ export async function runImport(opts: RunImportOptions): Promise<ImportSummary> 
       rowsRejected: rejects.length,
       rowsSkippedDuplicate: skipped,
       rowsAlreadyPresent: alreadyPresent,
+      rowsOptOutKept: optOutKept,
       durationMs: Date.now() - started,
     };
   } catch (e) {
@@ -183,13 +188,32 @@ async function idMap(sql: Sql, table: 'contacts' | 'campaigns', brandId: string)
   return new Map(rows.map((r) => [r.external_id, r.id]));
 }
 
+/**
+ * Opt-outs are sticky. A file can never move a stored contact out of `unsubscribed` or `bounced`,
+ * clear a stored `deleted_at`, raise consent on any stored contact, or shorten or clear a stored
+ * suppression. The file's age cannot be known (re-uploading an old export looks exactly like a
+ * correction), so the import fails closed: the opt-out stays, the contact is flagged
+ * `opt_out_kept`, and the import row counts them. Every other field still takes the file's value.
+ * Consent and suppression are only ever made stricter by an import; a new contact takes the
+ * file's values. Measured 2026-10-20 offline against the seed: the Kilele delta would otherwise
+ * move 295 unsubscribed or bounced contacts back to active and un-delete 7; see README section 7
+ * for what the consent and suppression rule changes in the seed load.
+ */
+const OPTED_OUT = `contacts.status in ('unsubscribed', 'bounced')`;
+const OPT_OUT_UNDONE = `(${OPTED_OUT} and excluded.status not in ('unsubscribed', 'bounced'))
+  or (excluded.consent_marketing and not contacts.consent_marketing)
+  or (contacts.deleted_at is not null and excluded.deleted_at is null)
+  or (contacts.suppressed_until > now()
+      and (excluded.suppressed_until is null or excluded.suppressed_until < contacts.suppressed_until))`;
+
 async function upsertContacts(
   sql: Sql,
   brandId: string,
   importId: string,
   rows: CanonicalContact[],
-) {
+): Promise<{ upserted: number; optOutKept: number }> {
   let n = 0;
+  let kept = 0;
   for (const batch of chunks(rows, BATCH.contacts)) {
     const values = batch.map((c) => ({
       brand_id: brandId,
@@ -208,7 +232,9 @@ async function upsertContacts(
       flags: c.flags,
       source_import_id: importId,
     }));
-    const res = await sql`
+    // In DO UPDATE every `contacts.` reference is the stored row, so the order of SET items does
+    // not matter. The mapper never emits `opt_out_kept`, so it marks exactly the kept rows.
+    const res = await sql<{ kept: boolean }[]>`
       insert into public.contacts ${sql(values)}
       on conflict (brand_id, external_id) do update set
         full_name = excluded.full_name,
@@ -217,16 +243,21 @@ async function upsertContacts(
         country = excluded.country,
         city = excluded.city,
         signup_at = excluded.signup_at,
-        status = excluded.status,
-        consent_marketing = excluded.consent_marketing,
-        deleted_at = excluded.deleted_at,
-        suppressed_until = excluded.suppressed_until,
+        status = case when ${sql.unsafe(OPTED_OUT)} then contacts.status else excluded.status end,
+        consent_marketing = contacts.consent_marketing and excluded.consent_marketing,
+        deleted_at = coalesce(contacts.deleted_at, excluded.deleted_at),
+        -- greatest() ignores nulls: a stored suppression is never shortened or cleared.
+        suppressed_until = greatest(contacts.suppressed_until, excluded.suppressed_until),
         notes = excluded.notes,
-        flags = excluded.flags,
-        source_import_id = excluded.source_import_id`;
+        flags = case when ${sql.unsafe(OPT_OUT_UNDONE)}
+          then array_append(array_remove(excluded.flags, 'opt_out_kept'), 'opt_out_kept')
+          else excluded.flags end,
+        source_import_id = excluded.source_import_id
+      returning 'opt_out_kept' = any(flags) as kept`;
     n += res.count;
+    kept += res.filter((r) => r.kept).length;
   }
-  return n;
+  return { upserted: n, optOutKept: kept };
 }
 
 async function upsertCampaigns(

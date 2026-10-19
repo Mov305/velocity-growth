@@ -106,7 +106,9 @@ CREATE TYPE "public"."recipient_status" AS ENUM (
     'opened',
     'clicked',
     'unsubscribed',
-    'complained'
+    'complained',
+    'withheld',
+    'unaccounted'
 );
 
 
@@ -245,6 +247,7 @@ CREATE OR REPLACE FUNCTION "public"."approve_send"("p_campaign_id" "uuid") RETUR
 declare
   v_brand uuid;
   v_send uuid;
+  v_status public.send_status;
   v_count integer;
 begin
   select brand_id into v_brand from public.campaigns where id = p_campaign_id;
@@ -255,12 +258,18 @@ begin
 
   perform pg_advisory_xact_lock(hashtext('approve_send'), hashtext(p_campaign_id::text));
 
-  select id into v_send from public.sends
+  select id, status into v_send, v_status from public.sends
   where campaign_id = p_campaign_id and brand_id = v_brand
     and provider_batch_id is null
     and status in ('approved', 'dispatching', 'failed')
   order by approved_at desc limit 1;
-  if v_send is not null then
+  -- A send in flight is returned, so approving twice never freezes two audiences. The exception
+  -- is a failed send with nothing left to hand over: no batch recorded and nobody queued.
+  if v_send is not null and not (
+    v_status = 'failed'
+    and not exists (select 1 from public.send_batches b where b.send_id = v_send)
+    and not exists (select 1 from public.send_recipients r where r.send_id = v_send and r.status = 'queued')
+  ) then
     return v_send;
   end if;
 
@@ -402,12 +411,19 @@ declare
   v_accepted integer;
   v_rejected integer;
   v_batches integer;
+  v_queued integer;
 begin
   select count(*)::int, coalesce(sum(accepted_count), 0)::int, coalesce(sum(rejected_count), 0)::int
   into v_batches, v_accepted, v_rejected
   from public.send_batches where send_id = p_send_id;
   if v_batches = 0 or v_batches <> p_expected_batches then
     raise exception 'expected % batches recorded for send, found %', p_expected_batches, v_batches
+      using errcode = 'P0002';
+  end if;
+  select count(*)::int into v_queued from public.send_recipients
+  where send_id = p_send_id and status = 'queued';
+  if v_queued > 0 then
+    raise exception '% recipients still queued after every batch was recorded', v_queued
       using errcode = 'P0002';
   end if;
   select provider_batch_id into v_first from public.send_batches
@@ -566,7 +582,7 @@ declare
   v_recipient uuid;
   v_occurred timestamptz;
   v_new public.recipient_status;
-  forward constant public.recipient_status[] := array['queued','rejected','accepted','delivered','opened','clicked']::public.recipient_status[];
+  forward constant public.recipient_status[] := array['queued','rejected','unaccounted','accepted','delivered','opened','clicked']::public.recipient_status[];
 begin
   select brand_id into v_brand from public.sends where id = p_send_id;
   if v_brand is null then
@@ -630,7 +646,7 @@ begin
     update public.send_recipients r
     set status = v_new, last_event_at = greatest(coalesce(r.last_event_at, v_occurred), v_occurred)
     where r.send_id = p_send_id and r.contact_id = v_recipient
-      and r.status not in ('bounced', 'complained', 'unsubscribed')
+      and r.status not in ('bounced', 'complained', 'unsubscribed', 'withheld')
       and (
         v_new in ('bounced', 'complained', 'unsubscribed')
         or array_position(forward, v_new) > array_position(forward, r.status)
@@ -745,29 +761,78 @@ end $$;
 ALTER FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_password" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") RETURNS "void"
+CREATE OR REPLACE FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_members" "uuid"[], "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb", "p_unidentified_rejections" integer) RETURNS TABLE("accepted" integer, "rejected" integer, "unaccounted" integer, "submitted" integer)
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
 declare
   v_brand uuid;
+  v_members integer;
+  v_known integer;
+  v_acc integer;
+  v_rej integer;
+  v_una integer;
 begin
   select brand_id into v_brand from public.sends where id = p_send_id and status = 'dispatching';
   if v_brand is null then
     raise exception 'send is not dispatching' using errcode = 'P0002';
   end if;
-  insert into public.send_batches (send_id, brand_id, chunk_index, idempotency_key, provider_batch_id, accepted_count, rejected_count, rejection_reasons)
-  values (p_send_id, v_brand, p_chunk_index, p_idempotency_key, p_batch_id,
-          coalesce(array_length(p_accepted, 1), 0), coalesce(array_length(p_rejected, 1), 0), coalesce(p_reasons, '{}'::jsonb))
-  on conflict (send_id, chunk_index) do nothing;
-  update public.send_recipients set status = 'accepted'
-  where send_id = p_send_id and contact_id = any(p_accepted) and status = 'queued';
-  update public.send_recipients set status = 'rejected'
-  where send_id = p_send_id and contact_id = any(p_rejected) and status = 'queued';
+  if p_unidentified_rejections is null or p_unidentified_rejections < 0 then
+    raise exception 'unidentified rejections must be a non-negative count' using errcode = '22023';
+  end if;
+
+  -- Already recorded (a takeover raced the original run): report what was stored, change nothing.
+  if exists (select 1 from public.send_batches b where b.send_id = p_send_id and b.chunk_index = p_chunk_index) then
+    return query
+      select b.accepted_count, b.rejected_count, b.unaccounted_count, b.submitted_count
+      from public.send_batches b where b.send_id = p_send_id and b.chunk_index = p_chunk_index;
+    return;
+  end if;
+
+  -- The chunk must be recipients of this send, every one of them.
+  select count(distinct m) into v_members from unnest(p_members) m;
+  select count(*) into v_known from public.send_recipients r
+  where r.send_id = p_send_id and r.contact_id = any(p_members);
+  if v_members = 0 or v_known <> v_members then
+    raise exception 'chunk % names % recipients, % of them in this send', p_chunk_index, v_members, v_known
+      using errcode = '22023';
+  end if;
+
+  -- Accepted wins over rejected if the provider names someone in both. A recipient withheld at
+  -- this hand-over whom the provider still names, either way, did reach the provider (the
+  -- idempotency key replayed a batch an earlier run posted), so the provider's answer is stored.
+  update public.send_recipients r set status = 'accepted', withheld_reason = null
+  where r.send_id = p_send_id and r.contact_id = any(p_members) and r.contact_id = any(p_accepted)
+    and r.status in ('queued', 'withheld');
+  update public.send_recipients r set status = 'rejected', withheld_reason = null
+  where r.send_id = p_send_id and r.contact_id = any(p_members) and r.contact_id = any(p_rejected)
+    and r.status in ('queued', 'withheld');
+  -- Posted, and named in neither list: never left queued, never re-posted. A withheld member the
+  -- answer does not name stays withheld (see the header of 20261020000300).
+  update public.send_recipients r set status = 'unaccounted'
+  where r.send_id = p_send_id and r.contact_id = any(p_members) and r.status = 'queued';
+
+  select count(*) filter (where r.status = 'accepted')::int,
+         count(*) filter (where r.status = 'rejected')::int,
+         count(*) filter (where r.status = 'unaccounted')::int
+  into v_acc, v_rej, v_una
+  from public.send_recipients r where r.send_id = p_send_id and r.contact_id = any(p_members);
+
+  insert into public.send_batches (
+    send_id, brand_id, chunk_index, idempotency_key, provider_batch_id,
+    accepted_count, rejected_count, unaccounted_count, submitted_count,
+    unidentified_rejections, rejection_reasons
+  )
+  values (
+    p_send_id, v_brand, p_chunk_index, p_idempotency_key, p_batch_id,
+    v_acc, v_rej, v_una, v_acc + v_rej + v_una,
+    p_unidentified_rejections, coalesce(p_reasons, '{}'::jsonb)
+  );
+  return query select v_acc, v_rej, v_una, v_acc + v_rej + v_una;
 end $$;
 
 
-ALTER FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") OWNER TO "postgres";
+ALTER FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_members" "uuid"[], "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb", "p_unidentified_rejections" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") RETURNS "void"
@@ -789,14 +854,33 @@ end $$;
 ALTER FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS TABLE("queued" integer, "accepted" integer, "rejected" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "total" integer, "events" integer, "batches" integer)
+CREATE OR REPLACE FUNCTION "public"."send_batches_needed"("p_send_id" "uuid", "p_cap" integer) RETURNS integer
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $$
+  select count(distinct x.chunk)::int
+  from (
+    select ((row_number() over (order by r.contact_id)) - 1) / p_cap as chunk, r.status
+    from public.send_recipients r
+    where r.send_id = p_send_id
+  ) x
+  where x.status <> 'withheld'
+$$;
+
+
+ALTER FUNCTION "public"."send_batches_needed"("p_send_id" "uuid", "p_cap" integer) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS TABLE("queued" integer, "withheld" integer, "accepted" integer, "rejected" integer, "unaccounted" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "total" integer, "events" integer, "batches" integer, "unidentified_rejections" integer, "withheld_reasons" "jsonb")
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
   select
     count(*) filter (where status = 'queued')::int,
+    count(*) filter (where status = 'withheld')::int,
     count(*) filter (where status = 'accepted')::int,
     count(*) filter (where status = 'rejected')::int,
+    count(*) filter (where status = 'unaccounted')::int,
     count(*) filter (where status = 'delivered')::int,
     count(*) filter (where status = 'opened')::int,
     count(*) filter (where status = 'clicked')::int,
@@ -805,7 +889,11 @@ CREATE OR REPLACE FUNCTION "public"."send_outcomes"("p_send_id" "uuid") RETURNS 
     count(*) filter (where status = 'unsubscribed')::int,
     count(*)::int,
     (select count(*)::int from public.provider_events e where e.send_id = p_send_id),
-    (select count(*)::int from public.send_batches b where b.send_id = p_send_id)
+    (select count(*)::int from public.send_batches b where b.send_id = p_send_id),
+    (select coalesce(sum(b.unidentified_rejections), 0)::int from public.send_batches b where b.send_id = p_send_id),
+    (select coalesce(jsonb_object_agg(w.withheld_reason, w.n), '{}'::jsonb) from (
+       select x.withheld_reason, count(*)::int as n from public.send_recipients x
+       where x.send_id = p_send_id and x.status = 'withheld' group by 1) w)
   from public.send_recipients r where r.send_id = p_send_id
 $$;
 
@@ -813,7 +901,7 @@ $$;
 ALTER FUNCTION "public"."send_outcomes"("p_send_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."share_results"("p_link_id" "uuid") RETURNS TABLE("brand_name" "text", "campaign_external_id" "text", "campaign_name" "text", "channel" "text", "expires_at" timestamp with time zone, "sends" integer, "approved" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "rejected" integer, "pending" integer, "last_dispatched_at" timestamp with time zone, "log_events" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."share_results"("p_link_id" "uuid") RETURNS TABLE("brand_name" "text", "campaign_external_id" "text", "campaign_name" "text", "channel" "text", "expires_at" timestamp with time zone, "sends" integer, "approved" integer, "delivered" integer, "opened" integer, "clicked" integer, "bounced" integer, "complained" integer, "unsubscribed" integer, "rejected" integer, "pending" integer, "unaccounted" integer, "withheld" integer, "last_dispatched_at" timestamp with time zone, "log_events" "jsonb")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -843,6 +931,8 @@ begin
     (select count(*)::int from r where status = 'unsubscribed'),
     (select count(*)::int from r where status = 'rejected'),
     (select count(*)::int from r where status in ('queued', 'accepted')),
+    (select count(*)::int from r where status = 'unaccounted'),
+    (select count(*)::int from r where status = 'withheld'),
     (select max(dispatched_at) from s),
     (select coalesce(jsonb_object_agg(t, n), '{}'::jsonb) from (
        select event_type::text as t, count(*)::int as n from public.engagement_events
@@ -879,6 +969,50 @@ $$;
 
 
 ALTER FUNCTION "public"."signups_last_30_days"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."withhold_uncontactable"("p_send_id" "uuid") RETURNS integer
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    SET "enable_nestloop" TO 'off'
+    AS $$
+declare
+  v_brand uuid;
+  v_count integer;
+begin
+  select brand_id into v_brand from public.sends where id = p_send_id and status = 'dispatching';
+  if v_brand is null then
+    raise exception 'send is not dispatching' using errcode = 'P0002';
+  end if;
+
+  update public.send_recipients r
+  set status = 'withheld',
+      withheld_reason = coalesce((
+        select case
+          when ct.deleted_at is not null then 'deleted'
+          when ct.status in ('unsubscribed', 'bounced')
+            or exists (select 1 from public.engagement_events e
+                       where e.contact_id = ct.id and e.event_type in ('bounce', 'complaint', 'unsubscribe'))
+            or exists (select 1 from public.send_recipients x
+                       where x.contact_id = ct.id and x.status in ('bounced', 'complained', 'unsubscribed'))
+            then 'unsubscribed, bounced or complained'
+          when not ct.consent_marketing then 'consent withdrawn'
+          when ct.suppressed_until is not null and ct.suppressed_until >= now() then 'suppressed'
+          when ct.status <> 'active' then 'status no longer active'
+          when ct.email is null and ct.phone is null then 'no email or phone'
+          else 'no longer contactable'
+        end
+        from public.contacts ct where ct.id = r.contact_id
+      ), 'no longer contactable')
+  where r.send_id = p_send_id
+    and r.status = 'queued'
+    and not exists (select 1 from public.contactable_contact_ids() c where c = r.contact_id);
+  get diagnostics v_count = row_count;
+  return v_count;
+end $$;
+
+
+ALTER FUNCTION "public"."withhold_uncontactable"("p_send_id" "uuid") OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."allowed_emails" (
@@ -1037,13 +1171,19 @@ CREATE TABLE IF NOT EXISTS "public"."imports" (
     "started_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "finished_at" timestamp with time zone,
     "error" "text",
-    "rows_already_present" integer DEFAULT 0 NOT NULL
+    "rows_already_present" integer DEFAULT 0 NOT NULL,
+    "rows_opt_out_kept" integer DEFAULT 0 NOT NULL,
+    CONSTRAINT "imports_rows_opt_out_kept_check" CHECK (("rows_opt_out_kept" >= 0))
 );
 
 ALTER TABLE ONLY "public"."imports" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."imports" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."imports"."rows_opt_out_kept" IS 'existing contacts where this file tried to undo a stored opt-out and the import kept the stored value: unsubscribed/bounced status, consent false (an import never raises consent), deleted_at, or a suppression still in force (an import never shortens or clears suppressed_until)';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."memberships" (
@@ -1101,13 +1241,24 @@ CREATE TABLE IF NOT EXISTS "public"."send_batches" (
     "poll_cursor" "text",
     "last_polled_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "send_batches_chunk_index_check" CHECK (("chunk_index" >= 0))
+    "submitted_count" integer NOT NULL,
+    "unaccounted_count" integer DEFAULT 0 NOT NULL,
+    "unidentified_rejections" integer DEFAULT 0 NOT NULL,
+    "poll_incomplete" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "send_batches_accounted_chk" CHECK (((("accepted_count" + "rejected_count") + "unaccounted_count") = "submitted_count")),
+    CONSTRAINT "send_batches_chunk_index_check" CHECK (("chunk_index" >= 0)),
+    CONSTRAINT "send_batches_unaccounted_count_check" CHECK (("unaccounted_count" >= 0)),
+    CONSTRAINT "send_batches_unidentified_rejections_check" CHECK (("unidentified_rejections" >= 0))
 );
 
 ALTER TABLE ONLY "public"."send_batches" FORCE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."send_batches" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."send_batches"."poll_incomplete" IS 'true while the last poll of this batch stopped at the page cap with has_more still true; poll_cursor holds where the next poll resumes';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."send_log_entries" (
@@ -1148,7 +1299,9 @@ CREATE TABLE IF NOT EXISTS "public"."send_recipients" (
     "contact_id" "uuid" NOT NULL,
     "brand_id" "uuid" NOT NULL,
     "status" "public"."recipient_status" DEFAULT 'queued'::"public"."recipient_status" NOT NULL,
-    "last_event_at" timestamp with time zone
+    "last_event_at" timestamp with time zone,
+    "withheld_reason" "text",
+    CONSTRAINT "send_recipients_withheld_reason_chk" CHECK ((("status" = 'withheld'::"public"."recipient_status") = ("withheld_reason" IS NOT NULL)))
 );
 
 ALTER TABLE ONLY "public"."send_recipients" FORCE ROW LEVEL SECURITY;
@@ -1753,14 +1906,20 @@ GRANT ALL ON FUNCTION "public"."publish_results"("p_campaign_id" "uuid", "p_pass
 
 
 
-REVOKE ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_members" "uuid"[], "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb", "p_unidentified_rejections" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."record_send_batch"("p_send_id" "uuid", "p_chunk_index" integer, "p_idempotency_key" "text", "p_batch_id" "text", "p_members" "uuid"[], "p_accepted" "uuid"[], "p_rejected" "uuid"[], "p_reasons" "jsonb", "p_unidentified_rejections" integer) TO "service_role";
 
 
 
 REVOKE ALL ON FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") TO "service_role";
 GRANT ALL ON FUNCTION "public"."revoke_share_link"("p_link_id" "uuid") TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."send_batches_needed"("p_send_id" "uuid", "p_cap" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."send_batches_needed"("p_send_id" "uuid", "p_cap" integer) TO "service_role";
+GRANT ALL ON FUNCTION "public"."send_batches_needed"("p_send_id" "uuid", "p_cap" integer) TO "authenticated";
 
 
 
@@ -1778,6 +1937,11 @@ GRANT ALL ON FUNCTION "public"."share_results"("p_link_id" "uuid") TO "service_r
 REVOKE ALL ON FUNCTION "public"."signups_last_30_days"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."signups_last_30_days"() TO "service_role";
 GRANT ALL ON FUNCTION "public"."signups_last_30_days"() TO "authenticated";
+
+
+
+REVOKE ALL ON FUNCTION "public"."withhold_uncontactable"("p_send_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."withhold_uncontactable"("p_send_id" "uuid") TO "service_role";
 
 
 

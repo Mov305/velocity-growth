@@ -79,7 +79,9 @@ export default async function SendsPage() {
                       <span className="text-muted-foreground">{c?.name}</span>
                     </TableCell>
                     <TableCell className="font-mono text-xs">
-                      {s.status}
+                      {s.status === 'failed' && s.last_error?.startsWith('paused:')
+                        ? 'paused'
+                        : s.status}
                       {s.last_error ? <span className="ml-2 text-bad">!</span> : null}
                     </TableCell>
                     <TableCell className="text-right font-mono text-xs">

@@ -377,6 +377,7 @@ export type Database = {
           id: string
           kind: Database["public"]["Enums"]["import_kind"]
           rows_already_present: number
+          rows_opt_out_kept: number
           rows_read: number
           rows_rejected: number
           rows_skipped_duplicate: number
@@ -394,6 +395,7 @@ export type Database = {
           id?: string
           kind: Database["public"]["Enums"]["import_kind"]
           rows_already_present?: number
+          rows_opt_out_kept?: number
           rows_read?: number
           rows_rejected?: number
           rows_skipped_duplicate?: number
@@ -411,6 +413,7 @@ export type Database = {
           id?: string
           kind?: Database["public"]["Enums"]["import_kind"]
           rows_already_present?: number
+          rows_opt_out_kept?: number
           rows_read?: number
           rows_rejected?: number
           rows_skipped_duplicate?: number
@@ -525,10 +528,14 @@ export type Database = {
           idempotency_key: string
           last_polled_at: string | null
           poll_cursor: string | null
+          poll_incomplete: boolean
           provider_batch_id: string
           rejected_count: number
           rejection_reasons: Json
           send_id: string
+          submitted_count: number
+          unaccounted_count: number
+          unidentified_rejections: number
         }
         Insert: {
           accepted_count?: number
@@ -539,10 +546,14 @@ export type Database = {
           idempotency_key: string
           last_polled_at?: string | null
           poll_cursor?: string | null
+          poll_incomplete?: boolean
           provider_batch_id: string
           rejected_count?: number
           rejection_reasons?: Json
           send_id: string
+          submitted_count: number
+          unaccounted_count?: number
+          unidentified_rejections?: number
         }
         Update: {
           accepted_count?: number
@@ -553,10 +564,14 @@ export type Database = {
           idempotency_key?: string
           last_polled_at?: string | null
           poll_cursor?: string | null
+          poll_incomplete?: boolean
           provider_batch_id?: string
           rejected_count?: number
           rejection_reasons?: Json
           send_id?: string
+          submitted_count?: number
+          unaccounted_count?: number
+          unidentified_rejections?: number
         }
         Relationships: [
           {
@@ -643,6 +658,7 @@ export type Database = {
           last_event_at: string | null
           send_id: string
           status: Database["public"]["Enums"]["recipient_status"]
+          withheld_reason: string | null
         }
         Insert: {
           brand_id: string
@@ -650,6 +666,7 @@ export type Database = {
           last_event_at?: string | null
           send_id: string
           status?: Database["public"]["Enums"]["recipient_status"]
+          withheld_reason?: string | null
         }
         Update: {
           brand_id?: string
@@ -657,6 +674,7 @@ export type Database = {
           last_event_at?: string | null
           send_id?: string
           status?: Database["public"]["Enums"]["recipient_status"]
+          withheld_reason?: string | null
         }
         Relationships: [
           {
@@ -982,13 +1000,24 @@ export type Database = {
           p_batch_id: string
           p_chunk_index: number
           p_idempotency_key: string
+          p_members: string[]
           p_reasons: Json
           p_rejected: string[]
           p_send_id: string
+          p_unidentified_rejections: number
         }
-        Returns: undefined
+        Returns: {
+          accepted: number
+          rejected: number
+          submitted: number
+          unaccounted: number
+        }[]
       }
       revoke_share_link: { Args: { p_link_id: string }; Returns: undefined }
+      send_batches_needed: {
+        Args: { p_cap: number; p_send_id: string }
+        Returns: number
+      }
       send_outcomes: {
         Args: { p_send_id: string }
         Returns: {
@@ -1003,7 +1032,11 @@ export type Database = {
           queued: number
           rejected: number
           total: number
+          unaccounted: number
+          unidentified_rejections: number
           unsubscribed: number
+          withheld: number
+          withheld_reasons: Json
         }[]
       }
       share_results: {
@@ -1025,7 +1058,9 @@ export type Database = {
           pending: number
           rejected: number
           sends: number
+          unaccounted: number
           unsubscribed: number
+          withheld: number
         }[]
       }
       signups_last_30_days: {
@@ -1035,6 +1070,7 @@ export type Database = {
           signups: number
         }[]
       }
+      withhold_uncontactable: { Args: { p_send_id: string }; Returns: number }
     }
     Enums: {
       channel: "email" | "sms"
@@ -1060,6 +1096,8 @@ export type Database = {
         | "clicked"
         | "unsubscribed"
         | "complained"
+        | "withheld"
+        | "unaccounted"
       send_status: "approved" | "dispatching" | "dispatched" | "failed"
     }
     CompositeTypes: {
@@ -1215,6 +1253,8 @@ export const Constants = {
         "clicked",
         "unsubscribed",
         "complained",
+        "withheld",
+        "unaccounted",
       ],
       send_status: ["approved", "dispatching", "dispatched", "failed"],
     },

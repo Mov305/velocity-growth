@@ -83,6 +83,8 @@ export default async function SharePage({ params }: PageProps<'/share/[token]'>)
     ['Unsubscribed', d.unsubscribed],
     ['Rejected at hand-over', d.rejected],
     ['Awaiting a provider report', d.pending],
+    ["Handed over, not named in the provider's answer", d.unaccounted],
+    ['Withheld: no longer contactable at hand-over, not sent', d.withheld],
   ];
   const log = Object.entries((d.log_events ?? {}) as Record<string, number>).sort(([a], [b]) =>
     a.localeCompare(b),
@@ -102,7 +104,7 @@ export default async function SharePage({ params }: PageProps<'/share/[token]'>)
 
       <section className="rise rise-2 mt-8 rounded-sm border border-rule bg-card p-6">
         <p className="text-xs text-muted-foreground">
-          Sent from this portal<span className="fn">1</span>
+          Approved for sending from this portal<span className="fn">1</span>
         </p>
         <p className="mt-1 font-mono text-4xl">{fmtNum(d.approved)}</p>
         <p className="mt-1 text-sm text-muted-foreground">

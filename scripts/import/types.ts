@@ -94,5 +94,11 @@ export type ImportSummary = {
   rowsSkippedDuplicate: number;
   /** Events already in the table from an earlier import; neither upserted nor rejected. */
   rowsAlreadyPresent: number;
+  /**
+   * Contacts whose stored opt-out (unsubscribed or bounced status, or a deletion) this file tried
+   * to undo and the import kept. They are also counted in rowsUpserted: their other fields
+   * updated. Always 0 for kinds other than contacts.
+   */
+  rowsOptOutKept: number;
   durationMs: number;
 };

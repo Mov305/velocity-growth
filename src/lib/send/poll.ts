@@ -8,8 +8,14 @@ export type PollResult = {
   sendId: string;
   /** Batches the send has. */
   batches: number;
-  /** Batches fully walked in this run. */
+  /** Batches walked to the end of their event stream in this run. */
   polled: number;
+  /**
+   * Batches whose walk stopped at MAX_PAGES with the provider still reporting has_more. They are
+   * not caught up: send_batches.poll_incomplete is true and the next poll resumes from the stored
+   * cursor. Not counted in `polled`.
+   */
+  truncated: number;
   /** Batches left untouched because the time budget ran out; the next run takes them first. */
   deferred: number;
   /** Batches that answered with an error this run; they stay least-recently-polled. */
@@ -20,10 +26,19 @@ export type PollResult = {
   duplicates: number;
   unknownRecipients: number;
   malformed: number;
+  /**
+   * Set when the provider answered 503 or 429: the run stopped and nothing else should call the
+   * provider in it. Seconds the provider asked to wait, or null when it did not say.
+   */
+  pausedFor?: number | null;
   error?: string;
 };
 
-const MAX_PAGES = 20;
+/** Event pages read per batch per run. Past this the batch is recorded as incomplete and resumed. */
+export const MAX_PAGES = 20;
+
+/** Statuses on which the provider is asking us to stop calling for a while. */
+const PAUSE_STATUSES = new Set([429, 503]);
 
 /**
  * Pulls what the provider has for the batches of one send and hands it to
@@ -35,8 +50,14 @@ const MAX_PAGES = 20;
  * Measured on 2026-09-16 with a 72-batch send: the events endpoint answers 503
  * "reports temporarily unavailable" with a retry_after partway through a long walk. So batches
  * are taken least-recently-polled first, an error on one batch is recorded and the walk moves on,
- * a 503 that asks for a pause ends the run, and a time budget ends the run before the caller's
- * own limit does. Every run makes progress; nothing depends on one run finishing everything.
+ * a 503 or 429 that asks for a pause ends the run, and a time budget ends the run before the
+ * caller's own limit does. Every run makes progress; nothing depends on one run finishing
+ * everything.
+ *
+ * A batch whose stream is longer than MAX_PAGES pages is not reported as walked: its next unread
+ * cursor is stored with poll_incomplete = true and the next poll resumes there (README section 3:
+ * `since=<next_cursor>` returns the next subset). Once a resumed walk reaches the end the flag
+ * clears and the following poll starts from the beginning again, which picks up late events.
  */
 export async function pollSend(
   sendId: string,
@@ -52,7 +73,9 @@ export async function pollSend(
   }
   const batches = await admin
     .from('send_batches')
-    .select('id, provider_batch_id, chunk_index, last_polled_at', { count: 'exact' })
+    .select('id, provider_batch_id, chunk_index, last_polled_at, poll_cursor, poll_incomplete', {
+      count: 'exact',
+    })
     .eq('send_id', sendId)
     .order('last_polled_at', { ascending: true, nullsFirst: true })
     .order('chunk_index', { ascending: true })
@@ -69,6 +92,7 @@ export async function pollSend(
     sendId,
     batches: batches.data.length,
     polled: 0,
+    truncated: 0,
     deferred: 0,
     failed: 0,
     pages: 0,
@@ -80,18 +104,26 @@ export async function pollSend(
   };
   const problems: string[] = [];
   const deadline = opts.deadlineMs ?? Number.POSITIVE_INFINITY;
-  let pausedBy: string | null = null;
+  let paused = false;
 
   for (let b = 0; b < batches.data.length; b++) {
     const batch = batches.data[b];
-    if (pausedBy || Date.now() >= deadline) {
+    if (paused || Date.now() >= deadline) {
       result.deferred = batches.data.length - b;
       break;
     }
-    let cursor: string | null = null;
-    const seenCursors = new Set<string>();
+    // Resume an incomplete walk from where the last one stopped; otherwise start at the beginning.
+    const resumeFrom = batch.poll_incomplete ? batch.poll_cursor : null;
+    let cursor: string | null = resumeFrom;
+    let truncated = false;
+    const seenCursors = new Set<string>(cursor ? [cursor] : []);
     try {
-      for (let page = 0; page < MAX_PAGES; page++) {
+      for (let page = 0; ; page++) {
+        if (page === MAX_PAGES) {
+          // has_more was true and `cursor` is the next unread page: not caught up.
+          truncated = true;
+          break;
+        }
         const res = await fetchEvents(batch.provider_batch_id, cursor);
         result.pages++;
         result.received += res.events.length;
@@ -107,27 +139,58 @@ export async function pollSend(
           result.duplicates += row?.duplicates ?? 0;
           result.unknownRecipients += row?.unknown_recipients ?? 0;
         }
+        // A repeated cursor means the provider is looping: treat the stream as ended.
         if (!res.hasMore || !res.nextCursor || seenCursors.has(res.nextCursor)) break;
         seenCursors.add(res.nextCursor);
         cursor = res.nextCursor;
       }
       const mark = await admin
         .from('send_batches')
-        .update({ poll_cursor: cursor, last_polled_at: new Date().toISOString() })
+        .update({
+          poll_cursor: truncated ? cursor : null,
+          poll_incomplete: truncated,
+          last_polled_at: new Date().toISOString(),
+        })
         .eq('id', batch.id);
       if (mark.error) throw new Error(`batch poll could not be recorded: ${mark.error.message}`);
-      result.polled++;
+      if (truncated) result.truncated++;
+      else result.polled++;
     } catch (e) {
       result.failed++;
       const message = e instanceof Error ? e.message : String(e);
       if (problems.length < 3) problems.push(`batch ${batch.chunk_index + 1}: ${message}`);
-      // The provider asked for a pause: stop this run, the scheduler is back in a minute.
-      if (e instanceof ProviderError && e.status === 503) pausedBy = message;
+      if (e instanceof ProviderError && e.status !== undefined && PAUSE_STATUSES.has(e.status)) {
+        // The provider asked for a pause (503 measured, 429 documented): stop this run and every
+        // other send's walk in it. The scheduler is back in a minute.
+        paused = true;
+        result.pausedFor = e.retryAfterSeconds ?? null;
+      } else if (
+        resumeFrom &&
+        e instanceof ProviderError &&
+        e.status !== undefined &&
+        e.status >= 400 &&
+        e.status < 500
+      ) {
+        // The stored cursor was refused (expired or unknown). Keep the batch marked incomplete but
+        // forget the cursor, so the next poll walks it from the beginning instead of failing forever.
+        const reset = await admin
+          .from('send_batches')
+          .update({ poll_cursor: null })
+          .eq('id', batch.id);
+        if (reset.error && problems.length < 3) {
+          problems.push(
+            `batch ${batch.chunk_index + 1}: cursor reset failed: ${reset.error.message}`,
+          );
+        }
+      }
     }
   }
 
   if (result.failed > 0) {
     result.error = `${result.failed} of ${result.batches} batches did not answer: ${problems.join('; ')}`;
+    if (paused) {
+      result.error += `; provider asked to pause${result.pausedFor ? ` for ${result.pausedFor}s` : ''}, run stopped`;
+    }
   }
   const done = await admin
     .from('sends')
@@ -142,8 +205,33 @@ export async function pollSend(
   return result;
 }
 
-/** How long after dispatch the scheduler keeps asking the provider for feedback. */
+/**
+ * How long after dispatch the scheduler keeps asking the provider for feedback. This constant is
+ * the only definition of the feedback window; the scheduler, the idle check and the send page's
+ * wording all follow it.
+ */
 export const POLL_WINDOW_DAYS = 7;
+
+function pollWindowStart(): string {
+  return new Date(Date.now() - POLL_WINDOW_DAYS * 86_400_000).toISOString();
+}
+
+/**
+ * How many sends the scheduler would poll right now: dispatched within the window. The poll route
+ * calls this first so a minute with nothing to do costs one indexed count and no provider call.
+ * An error throws; it is never read as "nothing to do".
+ */
+export async function countPollableSends(): Promise<number> {
+  const admin = createAdminClient();
+  const res = await admin
+    .from('sends')
+    .select('id', { count: 'exact', head: true })
+    .eq('status', 'dispatched')
+    .gte('dispatched_at', pollWindowStart());
+  if (res.error) throw new Error(`sends count failed: ${res.error.message}`);
+  if (res.count === null) throw new Error('sends count failed: no count returned');
+  return res.count;
+}
 
 /** What one scheduled run may spend, under the route's 60-second limit and pg_net's timeout. */
 export const POLL_RUN_BUDGET_MS = 50_000;
@@ -153,11 +241,24 @@ export const POLL_RUN_BUDGET_MS = 50_000;
  * never polled is a silent hole. The measured provider emitted new events minutes after dispatch;
  * a week covers late opens generously. Older sends stay readable and can still be polled by hand
  * from their page. One time budget covers the whole run; what does not fit goes first next time.
+ * A 503 or 429 from the provider ends the whole run, not just one send's walk. A retry_after
+ * longer than the scheduler's one-minute interval is not carried between runs (inferred safe: the
+ * measured value was 22 s).
  */
-export async function pollAllDispatched(opts: { budgetMs?: number } = {}): Promise<PollResult[]> {
+export type PollRun = {
+  results: PollResult[];
+  /** sends inside the feedback window when the run started */
+  pollable: number;
+  /** pollable sends this run did not reach: they go first next run, being least recently polled */
+  skipped: number;
+  /** why the run stopped before reaching every pollable send; null when it reached them all */
+  stoppedBy: 'budget' | 'provider_pause' | null;
+};
+
+export async function pollAllDispatched(opts: { budgetMs?: number } = {}): Promise<PollRun> {
   const admin = createAdminClient();
   const deadlineMs = Date.now() + (opts.budgetMs ?? POLL_RUN_BUDGET_MS);
-  const since = new Date(Date.now() - POLL_WINDOW_DAYS * 86_400_000).toISOString();
+  const since = pollWindowStart();
   const sends = await admin
     .from('sends')
     .select('id', { count: 'exact' })
@@ -171,10 +272,22 @@ export async function pollAllDispatched(opts: { budgetMs?: number } = {}): Promi
       `${sends.count} sends need polling but only ${sends.data.length} fit in one run`,
     );
   }
-  const out: PollResult[] = [];
+  const results: PollResult[] = [];
+  let stoppedBy: PollRun['stoppedBy'] = null;
   for (const s of sends.data) {
-    if (Date.now() >= deadlineMs) break;
-    out.push(await pollSend(s.id, { deadlineMs }));
+    if (Date.now() >= deadlineMs) {
+      stoppedBy = 'budget';
+      break;
+    }
+    const r = await pollSend(s.id, { deadlineMs });
+    results.push(r);
+    // The provider asked for a pause on this send's walk; it applies to every send.
+    if (r.pausedFor !== undefined) {
+      stoppedBy = 'provider_pause';
+      break;
+    }
   }
-  return out;
+  const pollable = sends.data.length;
+  const skipped = pollable - results.length;
+  return { results, pollable, skipped, stoppedBy: skipped > 0 ? stoppedBy : null };
 }

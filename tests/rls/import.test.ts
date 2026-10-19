@@ -207,6 +207,102 @@ describe('import pipeline against the database', () => {
     expect(imports.n).toBe(8);
   });
 
+  it('never undoes an opt-out: an older file cannot reactivate, re-consent, unsuppress or undelete', async () => {
+    const header =
+      'external_id,full_name,email,phone,country,city,signup_at,status,consent_marketing,deleted_at,suppressed_until,brand_code,notes';
+    const upload = async (name: string, lines: string[]) => {
+      const s = await runImport({
+        brandCode: 'KILELE',
+        kind: 'contacts',
+        sql,
+        source: { fileName: name, bytes: new TextEncoder().encode([header, ...lines].join('\n')) },
+      });
+      importIds.push(s.importId);
+      return s;
+    };
+    // A newer export deletes CT-900000001 and withdraws CT-900000002's consent (still active,
+    // suppressed until 2027-05-16). Setting an opt-out is always allowed.
+    const newer = await upload('newer.csv', [
+      'CT-900000001,Simon Kamau,simon.fixture@vg-eval.test,0704279001,KE,Nakuru,2026-02-19T23:47:04Z,active,true,2026-09-01T00:00:00Z,,KILELE,fixture',
+      'CT-900000002,Second Version,second.fixture@vg-eval.test,+254 721 913 662,KE,Nairobi,2026-02-01T00:10:00Z,active,no,,2027-05-16T00:00:00Z,KILELE,fixture withdrawn',
+    ]);
+    expect(newer.rowsOptOutKept).toBe(0);
+
+    // Then the older export is uploaded again: CT-900000001 not deleted, CT-900000002 (active,
+    // consent withdrawn, suppressed) with consent and no suppression, CT-900000005 (stored
+    // unsubscribed, no consent) active with consent, CT-900000006 (pending, no consent) active
+    // with consent. An import never raises consent on a stored contact, whatever its status, and
+    // never shortens a suppression; status on a contact that is not opted out still follows.
+    const older = await upload('older.csv', [
+      'CT-900000001,Simon Kamau,simon.fixture@vg-eval.test,0704279001,KE,Nakuru,2026-02-19T23:47:04Z,active,true,,,KILELE,fixture',
+      'CT-900000002,Second Version,second.fixture@vg-eval.test,+254 721 913 662,KE,Nairobi,2026-02-01T00:10:00Z,active,yes,,,KILELE,fixture old',
+      'CT-900000005,Renamed Back,john.fixture@vg-eval.test,0704279002,KE,Kisumu,2026-02-01T00:00:00Z,active,yes,,,KILELE,fixture',
+      'CT-900000006,Now Named,six.fixture@vg-eval.test,0704279003,KE,Nyeri,2026-02-01T00:00:00Z,active,yes,,,KILELE,fixture',
+    ]);
+    expect(older).toMatchObject({ rowsRead: 4, rowsUpserted: 4, rowsOptOutKept: 4 });
+    const [stored] = await sql<{ rows_opt_out_kept: number }[]>`
+      select rows_opt_out_kept from public.imports where id = ${older.importId}`;
+    expect(stored.rows_opt_out_kept).toBe(4);
+
+    const rows = await sql<
+      {
+        external_id: string;
+        full_name: string;
+        status: string;
+        consent_marketing: boolean;
+        deleted: boolean;
+        suppressed_until: string | null;
+        kept: boolean;
+      }[]
+    >`
+      select external_id, full_name, status::text as status, consent_marketing,
+             deleted_at is not null as deleted,
+             to_char(suppressed_until at time zone 'UTC', 'YYYY-MM-DD') as suppressed_until,
+             'opt_out_kept' = any(flags) as kept
+      from public.contacts
+      where brand_id = ${brandId}
+        and external_id in ('CT-900000001', 'CT-900000002', 'CT-900000005', 'CT-900000006')
+      order by external_id`;
+    expect(rows).toEqual([
+      {
+        external_id: 'CT-900000001',
+        full_name: 'Simon Kamau',
+        status: 'active',
+        consent_marketing: true,
+        deleted: true,
+        suppressed_until: null,
+        kept: true,
+      },
+      {
+        external_id: 'CT-900000002',
+        full_name: 'Second Version',
+        status: 'active',
+        consent_marketing: false,
+        deleted: false,
+        suppressed_until: '2027-05-16',
+        kept: true,
+      },
+      {
+        external_id: 'CT-900000005',
+        full_name: 'Renamed Back',
+        status: 'unsubscribed',
+        consent_marketing: false,
+        deleted: false,
+        suppressed_until: null,
+        kept: true,
+      },
+      {
+        external_id: 'CT-900000006',
+        full_name: 'Now Named',
+        status: 'active',
+        consent_marketing: false,
+        deleted: false,
+        suppressed_until: null,
+        kept: true,
+      },
+    ]);
+  });
+
   it('marks an import left running by a dead process as failed with a reason', async () => {
     const [stale] = await sql<{ id: string }[]>`
       insert into public.imports (brand_id, kind, file_name, file_sha256, encoding, status)

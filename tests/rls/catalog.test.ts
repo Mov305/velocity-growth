@@ -1,5 +1,6 @@
 import postgres from 'postgres';
 import { afterAll, describe, expect, it } from 'vitest';
+import { BRAND_ID_TABLES_TESTED_SEPARATELY, TENANT_TABLES } from './fixtures';
 import { rlsEnv } from './setup';
 
 /**
@@ -62,6 +63,57 @@ describe('RLS catalog: the isolation guarantee cannot be removed without this fa
     expect(denyAll, 'tables relying on deny-all must be exactly this list').toEqual([
       'allowed_emails',
     ]);
+  });
+
+  it('the isolation suite covers every table that has a brand_id column', async () => {
+    const rows = await sql<{ table_name: string }[]>`
+      select c.table_name from information_schema.columns c
+      join information_schema.tables t
+        on t.table_schema = c.table_schema and t.table_name = c.table_name
+      where c.table_schema = 'public' and c.column_name = 'brand_id' and t.table_type = 'BASE TABLE'
+      order by c.table_name`;
+    const covered = [...TENANT_TABLES, ...BRAND_ID_TABLES_TESTED_SEPARATELY].sort();
+    expect(
+      rows.map((r) => r.table_name),
+      'brand_id tables in the database vs TENANT_TABLES in tests/rls/fixtures.ts',
+    ).toEqual(covered);
+  });
+
+  it('every policy is exactly one of the known isolation predicates, select-only, for authenticated', async () => {
+    // A policy weakened to `using (true)`, widened with `or ...`, or turned into a write policy
+    // still counts as "a policy" above; this pins what each one says.
+    const BRAND = '(brand_id IN ( SELECT app.user_brand_ids() AS user_brand_ids))';
+    const expected: Record<string, string> = {
+      brands: '(id IN ( SELECT app.user_brand_ids() AS user_brand_ids))',
+      memberships: '(user_id = auth.uid())',
+      ...Object.fromEntries(TENANT_TABLES.map((t) => [t, BRAND])),
+    };
+    const rows = await sql<
+      {
+        tablename: string;
+        cmd: string;
+        roles: string[];
+        permissive: string;
+        qual: string | null;
+        with_check: string | null;
+      }[]
+    >`
+      select tablename, cmd, roles::text[] as roles, permissive, qual, with_check
+      from pg_policies where schemaname = 'public' order by tablename, policyname`;
+    const wrong = rows
+      .filter(
+        (r) =>
+          r.cmd !== 'SELECT' ||
+          r.permissive !== 'PERMISSIVE' ||
+          r.roles.join(',') !== 'authenticated' ||
+          r.with_check !== null ||
+          r.qual !== expected[r.tablename],
+      )
+      .map((r) => `${r.tablename}: ${r.cmd} ${r.roles.join(',')} using ${r.qual}`);
+    expect(wrong, 'policies that differ from the isolation predicate').toEqual([]);
+    // And every table that should have one does.
+    const withPolicy = new Set(rows.map((r) => r.tablename));
+    expect(Object.keys(expected).filter((t) => !withPolicy.has(t))).toEqual([]);
   });
 
   it('anon has no privileges on any public table', async () => {

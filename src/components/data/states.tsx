@@ -141,6 +141,7 @@ const FLAG_LABEL: Record<string, string> = {
   name_missing: 'no name',
   brand_code_missing: 'brand code missing',
   parent_unresolved: 'parent not in this brand',
+  opt_out_kept: 'opt-out kept',
 };
 
 export function Flags({ flags }: { flags: string[] }) {

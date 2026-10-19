@@ -124,6 +124,11 @@ export default async function ImportsPage({ searchParams }: PageProps<'/imports'
                   </TableCell>
                   <TableCell className="text-right font-mono text-xs">
                     {fmtNum(i.rows_upserted)}
+                    {i.rows_opt_out_kept > 0 ? (
+                      <span className="block text-[11px] text-warn">
+                        {fmtNum(i.rows_opt_out_kept)} opt-outs kept
+                      </span>
+                    ) : null}
                   </TableCell>
                   <TableCell className="text-right font-mono text-xs">
                     {i.rows_rejected > 0 ? (
