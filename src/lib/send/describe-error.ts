@@ -30,6 +30,17 @@ export function describeSendError(raw: string | null | undefined): string | null
   if (/audience size \d+ differs from approved \d+/.test(raw)) {
     return raw.replace(/^.*?(audience size)/, 'The $1') + '.';
   }
+  // Database errors come before the network check: a Postgres "statement timeout" also matches
+  // /timeout/ and was shown as an unreachable provider.
+  // withhold_uncontactable runs before any chunk of this run is posted.
+  if (/^withhold_uncontactable failed/.test(raw)) {
+    return /statement timeout/i.test(raw)
+      ? 'The database took too long checking who is still contactable, before this run posted anything.'
+      : 'The database could not check who is still contactable, before this run posted anything.';
+  }
+  if (/statement timeout/i.test(raw)) {
+    return 'A database step took too long during the hand-over.';
+  }
   if (/timeout|aborted|fetch failed|ECONN|ENOTFOUND/i.test(raw)) {
     return 'The messaging provider could not be reached.';
   }

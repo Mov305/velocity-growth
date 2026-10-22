@@ -26,6 +26,20 @@ describe('describeSendError', () => {
       "3 of 72 provider batches did not answer (HTTP 503 from the provider's feedback endpoint). Nothing about the send changed; feedback is fetched again every minute, the batches waiting longest first.",
     );
   });
+  it('never reports a database statement timeout as an unreachable provider', () => {
+    const withhold = describeSendError(
+      'withhold_uncontactable failed: canceling statement due to statement timeout',
+    );
+    expect(withhold).toMatch(/database took too long checking who is still contactable/);
+    expect(withhold).not.toMatch(/provider could not be reached/);
+    const later = describeSendError(
+      'record_send_batch failed: canceling statement due to statement timeout',
+    );
+    expect(later).toBe('A database step took too long during the hand-over.');
+    expect(describeSendError('provider dispatch failed: fetch failed')).toBe(
+      'The messaging provider could not be reached.',
+    );
+  });
   it('is null for no error', () => {
     expect(describeSendError(null)).toBeNull();
   });
